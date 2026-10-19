@@ -137,7 +137,7 @@ Each profile has its own plugin, settings and history. Install with `hermes -p <
 
 ## Health
 
-If the plugin fails at any point, your message is still sent. If the Send/Cancel box itself fails, the message is sent, the box is off until Hermes restarts (`block` acts as `warn`), and cacheguard prints one plain line: `the Send/Cancel box failed, so messages now go out with a warning until Hermes restarts. Details: /cacheguard show`. A Cancel you already gave stays "not sent". An answer cacheguard cannot read prints `unreadable answer in the Send/Cancel box: message not sent`.
+If the plugin fails at any point, your message is still sent. If the Send/Cancel box itself fails, the message is sent, the box is off until Hermes restarts (`block` acts as `warn`), and cacheguard prints one plain line: `the Send/Cancel box failed, so messages now go out with a warning until Hermes restarts. Details: /cacheguard`. The same happens if Hermes answers in a form cacheguard does not know. A Cancel you already gave stays "not sent". Text you type in the box that cacheguard cannot read prints `unreadable answer in the Send/Cancel box: message not sent`.
 
 - `/cacheguard` prints a `health: degraded` line only when something is wrong. No such line = it works.
 - At startup cacheguard checks the Hermes parts it relies on. If one moved, it prints one plain sentence per problem. `/cacheguard` then lists the problem under `health: degraded`, with the technical name and detail.

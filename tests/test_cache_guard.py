@@ -518,7 +518,7 @@ def test_block_callback_raises_sends_and_switches_the_box_off(env):
     assert calls == 1 and out is sentinel
     assert env.printed.count(
         "[CACHEGUARD] the Send/Cancel box failed, so messages now go out with a warning "
-        "until Hermes restarts. Details: /cacheguard show") == 1
+        "until Hermes restarts. Details: /cacheguard") == 1
     assert env.plugin._H["box_failed"] == "RuntimeError"
     assert "Send/Cancel box failed this session" in env.plugin._health_text()
 
@@ -647,7 +647,7 @@ def _gateway_block(env, monkeypatch, decision):
     seed_session(env, ago=3600)
 
 
-@pytest.mark.parametrize("decision", [None, "cancel", ["resolved"], RuntimeError("wait crashed")])
+@pytest.mark.parametrize("decision", [None, "cancel", "x", ["resolved"], {}, {"foo": 1}, RuntimeError("wait crashed")])
 def test_gateway_bad_decision_or_error_sends_once_and_switches_the_box_off(env, monkeypatch, decision):
     _gateway_block(env, monkeypatch, decision)
     out, calls, sentinel = _run_counting(env, platform="telegram")
@@ -657,7 +657,9 @@ def test_gateway_bad_decision_or_error_sends_once_and_switches_the_box_off(env, 
 
 @pytest.mark.parametrize("decision,word", [
     ({"resolved": True, "choice": "deny"}, "cancelled"),
-    ({}, "timeout"),
+    ({"resolved": False, "choice": None}, "timeout"),
+    ({"resolved": False, "choice": None, "reason": "timeout"}, "timeout"),
+    ({"resolved": False, "choice": None, "notify_failed": True}, "could not be delivered"),
     ({"notify_failed": True}, "could not be delivered"),
 ])
 def test_gateway_cancel_timeout_undelivered_stay_not_sent(env, monkeypatch, decision, word):
@@ -2639,6 +2641,50 @@ def test_cli_box_unreadable_answer_sends_nothing_and_shows_degraded_line(env, an
     assert [n for n in env.plugin._H["noticed"] if "Send/Cancel box" in n]
 
 
+def _cb_box(env, answer, helper_owner=False):
+    env.approval = lambda *a, **k: answer
+    env.config["cli"] = "block"
+    seed_session(env, ago=3600)
+    return _run_counting(env)
+
+
+@pytest.mark.parametrize("answer", ["weird", "", 7, {"x": 1}, ["once"], True])
+def test_cli_unknown_answer_value_sends_once_and_switches_the_box_off(env, answer):
+    out, calls, sentinel = _cb_box(env, answer)
+    assert calls == 1 and out is sentinel
+    assert len(_box_broke_notices(env)) == 1 and env.plugin._H["box_failed"] == "ValueError"
+
+
+@pytest.mark.parametrize("answer,word", [("deny", "(cancelled)"), ("timeout", "timeout")])
+def test_cli_cancel_and_timeout_stay_not_sent(env, answer, word):
+    out, calls, _ = _cb_box(env, answer)
+    assert calls == 0 and word in out.choices[0].message.content
+    assert not _box_broke_notices(env)
+
+
+@pytest.mark.parametrize("answer", ["once", "session", "always"])
+def test_cli_known_send_values_send_once_without_box_failure(env, answer):
+    out, calls, sentinel = _cb_box(env, answer)
+    assert calls == 1 and out is sentinel and not _box_broke_notices(env)
+
+
+@pytest.mark.parametrize("answer", [7, {"x": 1}, ["once"]])
+def test_cli_modal_non_text_answer_sends_once_and_switches_the_box_off(env, answer):
+    _hermes_like_owner(env, answer)
+    env.config["cli"] = "block"
+    seed_session(env, ago=3600)
+    out, calls, sentinel = _run_counting(env)
+    assert calls == 1 and out is sentinel and len(_box_broke_notices(env)) == 1
+
+
+def test_cli_modal_timeout_is_not_sent(env):
+    _hermes_like_owner(env, None)
+    env.config["cli"] = "block"
+    seed_session(env, ago=3600)
+    out, calls, _ = _run_counting(env)
+    assert calls == 0 and not _box_broke_notices(env)
+
+
 def test_cli_box_unreadable_answer_degraded_line_shows_once(env):
     _hermes_like_owner(env, "maybe")
     _box(env)
@@ -2675,7 +2721,6 @@ def test_health_checks_the_answer_helper(env):
     ({"resolved": True, "choice": None}, False, "(cancelled)"),
     ({"resolved": False, "choice": "once"}, False, "(cancelled)"),
     ({"resolved": False, "choice": None}, False, "timeout"),
-    ({}, False, "timeout"),
 ])
 def test_gateway_decision_only_explicit_allow_sends(env, monkeypatch, decision, sent, word):
     wait = types.ModuleType("tools.approval_gateway_wait")
@@ -2838,7 +2883,7 @@ def test_request_health_check_listed(env):
     assert "request_middleware" in env.plugin._health()
 
 
-# ------------------------------------------------- fail-open paths (T39) ----
+# ------------------------------------------------- fail-open paths ----------
 
 
 def test_error_before_the_box_calls_provider_exactly_once(env, monkeypatch):
@@ -2887,7 +2932,7 @@ def test_session_env_uses_gateway_session_value_over_os_environ(env, monkeypatch
     _fake_gateway_session_context(monkeypatch, lambda name, default="": {"HERMES_SESSION_KEY": "k1"}.get(name, default))
     monkeypatch.setenv("HERMES_SESSION_KEY", "from-environ")
     assert env.plugin._session_env("HERMES_SESSION_KEY") == "k1"
-    assert env.plugin._session_env("UNSET_NAME_T39") == ""
+    assert env.plugin._session_env("UNSET_NAME_FOR_TEST") == ""
 
 
 def test_session_env_falls_back_to_os_environ_when_gateway_read_raises(env, monkeypatch):
@@ -3046,7 +3091,7 @@ def test_approval_timeout_falls_back_when_the_helper_is_missing_or_fails(env, mo
     assert env.plugin._approval_timeout() == 300
 
 
-# --- big journal: read only its end, trim rarely (T36) -------------------------------------------
+# --- big journal: read only its end, trim rarely -------------------------------------------------
 
 def _journal_row(sid="other", ts=1.0, prompt=1000, **extra):
     row = {"ts": ts, "session_id": sid, "model": "p/m1", "api_mode": "chat_completions",

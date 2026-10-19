@@ -5,7 +5,7 @@ A Hermes plugin for prompt-cache cost. After a pause, the provider may have drop
 ## Safe by default
 
 - cacheguard never calls the model itself, and nothing leaves your machine.
-- If the plugin fails at any point, your message is still sent. If the Send/Cancel box itself fails, cacheguard only warns until Hermes restarts.
+- If the plugin fails at any point, your message is still sent. If the Send/Cancel box itself fails, or Hermes answers in a form cacheguard does not know, cacheguard only warns until Hermes restarts.
 
 ## Install
 
@@ -27,7 +27,7 @@ Manual install: clone into the plugin folder, which must be named `cacheguard`, 
     git clone https://github.com/AIverflow/hermes-cacheguard.git ~/.hermes/plugins/cacheguard
     hermes plugins enable cacheguard
 
-Use `/cacheguard` in a chat and `hermes cacheguard` in a terminal. Both take the same commands.
+Use `/cacheguard` in a chat. In a terminal, `hermes cacheguard` only takes `setup` and `off`.
 
 ## Quick setup
 

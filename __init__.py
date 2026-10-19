@@ -1268,6 +1268,8 @@ def _gateway_confirmation(payload: Dict[str, Any], command: str, deny_text: str,
                 "command": command, "description": "cacheguard", "pattern_key": pattern,
                 "pattern_keys": [pattern], "allow_session": False, "allow_permanent": False,
             })
+            if not isinstance(decision, dict) or not ("resolved" in decision or decision.get("notify_failed")):
+                raise ValueError("unexpected box answer")  # Hermes changed shape: a box failure, not a Cancel
             if decision.get("resolved") and decision.get("choice") in ("once", "session", "always"):
                 return None
             if decision.get("notify_failed"):
@@ -1548,6 +1550,8 @@ def _confirmation_screen(kwargs: Dict[str, Any], command: str, deny_text: str, m
             if box is not None:
                 box["shown"] = True
             answer = cb(command, "Possible cache cost", allow_permanent=False, allow_session=False)
+            if answer is not None and answer not in ("once", "session", "always", "deny", "timeout"):
+                raise ValueError("unexpected box answer")  # not a value Hermes gives: a box failure
         if answer not in ("once", "session", "always"):  # Hermes returns "timeout" (no answer) after printing "denying command"
             outcome = "timeout" if answer == "timeout" else "cancelled"
             if box is not None:
@@ -1565,7 +1569,7 @@ def _confirmation_screen(kwargs: Dict[str, Any], command: str, deny_text: str, m
 
 _NOT_SENT_TEXT = _PREFIX + " BLOCKED · message not sent"
 _BOX_OFF_TEXT = ("the Send/Cancel box failed, so messages now go out with a warning "
-                 "until Hermes restarts. Details: /cacheguard show")
+                 "until Hermes restarts. Details: /cacheguard")
 
 
 def _box_broke(exc: BaseException) -> None:
@@ -1595,10 +1599,14 @@ def _box_answer(owner: Any, answer: Any, choices: Any) -> str:
 
     Typed answers work: "send" and "1" send, "2" cancels, Hermes' own aliases (y, no, ...)
     are read by its helper. Without the helper, only the exact choice ids count. An answer
-    nobody can read is not a Send: it prints one plain line and the message is not sent.
+    nobody can read is typed text, not a Send: it prints one plain line and the message is not
+    sent. An answer that is not text at all means the box changed shape: it raises, the caller
+    treats it as a box failure (message sent, box off).
     """
     if answer is None:
         return "timeout"
+    if not isinstance(answer, str):
+        raise ValueError("unexpected box answer")  # not text at all: a box failure, not a human answer
     if isinstance(answer, str):
         answer = _BOX_ALIASES.get(answer.strip().lower(), answer)
     normalized = answer if answer in ("once", "deny") else None  # exact match, no helper needed

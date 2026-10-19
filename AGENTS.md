@@ -14,7 +14,8 @@ Hermes plugin that warns or asks before a large chat message is sent after a pau
 
 ## Rules the code must keep
 - **Any plugin error, or an error in the box call (`modal`, `cb`, `_await_gateway_decision`), → the message is sent**, before, during or after the box. Only exception: a Cancel (or timeout) already received stays "not sent"; if even that reply fails, send. Never raise into the middleware.
-- **After a box-call error the box is off until Hermes restarts**: `block` acts as `warn`, one plain notice line, and `/cacheguard show` health says so.
+- **An answer from Hermes in a shape or value we do not know (gateway decision not a dict or without `resolved`/`notify_failed`; CLI answer not text or not one of once/session/always/deny/timeout) is a box failure**: the message is sent and the box goes off. Typed text we cannot read in our own box stays "not sent".
+- **After a box-call error the box is off until Hermes restarts**: `block` acts as `warn`, one plain notice line, and `/cacheguard` health says so.
 - **A box nobody answers (cancel, timeout, never delivered) → nothing is sent.**
 - **No screen to show a box** (`-Q`, `-z`) → `block` becomes `warn`.
 - **Never call the provider twice**: the provider call stays outside plugin exception handling.
