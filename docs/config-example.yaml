@@ -1,0 +1,23 @@
+# cacheguard settings. Put them in your Hermes config.yaml under:
+#
+# plugins:
+#   entries:
+#     cacheguard:
+#       settings:
+#
+# All keys are optional. The values below are the defaults.
+
+plugins:
+  entries:
+    cacheguard:
+      settings:
+        enabled: true              # false = full stop: no box, no line, no measuring
+        cli: warn                  # terminal, editor: off | warn | block
+        # desktop: warn            # desktop app, web UI: off | warn | block (unset = same as cli)
+        gateway: "off"             # Telegram and other chat apps: off | warn | block
+        # model_change: warn       # switching model or provider: off | warn | block (unset = same as the chat's mode)
+        min_context_tokens: 20000  # only act on prompts at least this large (estimated tokens)
+        min_gap_seconds: 600       # idle time before a chat counts as paused (600 = 10 minutes; for Claude, whose cache lasts 5 minutes, use 240)
+        show_model: false          # add a "using provider model" line to the box, result line and refusal (useful with many models)
+        display_on_success: false  # show the result line when the cache was kept (loss and unknown always show)
+        max_observations: 10000    # history rows kept; minimum 1000, trimmed once 10% over

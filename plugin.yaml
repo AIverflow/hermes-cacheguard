@@ -1,0 +1,42 @@
+name: cacheguard
+version: "0.2.0"
+tested_hermes: "0.21.5"
+description: "Warns or asks before a large chat is sent after a pause, when the prompt cache may have expired, and shows how often the cache was lost."
+author: "AIverflow"
+requires_hermes: ">=0.21.5"
+config_schema:
+  enabled:
+    type: bool
+    description: "true or false, default true. false = full stop: no box, no line, no measuring"
+  cli:
+    type: str
+    description: "Terminal, editor. off, warn or block; default warn"
+  desktop:
+    type: str
+    description: "Desktop app, web UI. off, warn or block; default unset (follows cli)"
+  gateway:
+    type: str
+    description: "Telegram and other chat apps. off, warn or block; default off"
+  model_change:
+    type: str
+    description: "Switching model or provider. off, warn or block; default unset (follows the group's mode)"
+  show_model:
+    type: bool
+    description: "Name the model in the box and result line. true or false; default false"
+  display_on_success:
+    type: bool
+    description: "Show the result line when the cache was kept (loss and unknown always show). true or false; default false"
+  min_context_tokens:
+    type: int
+    description: "Smallest context to act on, in tokens. Whole number, 0 or more; default 20000"
+  min_gap_seconds:
+    type: number
+    description: "Idle seconds that count as a pause. Number, 0 or more; default 600 (10 minutes)"
+  max_observations:
+    type: int
+    description: "History rows kept. Whole number, 1000 or more; default 10000"
+provides_middleware:
+  - llm_request
+  - llm_execution
+provides_hooks:
+  - transform_llm_output
