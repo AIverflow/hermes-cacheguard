@@ -11,13 +11,9 @@ plugins:
   entries:
     cacheguard:
       settings:
-        enabled: true              # false = full stop: no box, no line, no measuring
         cli: warn                  # terminal, editor: off | warn | block
-        # desktop: warn            # desktop app, web UI: off | warn | block (unset = same as cli)
-        gateway: "off"             # Telegram and other chat apps: off | warn | block
-        # model_change: warn       # switching model or provider: off | warn | block (unset = same as the chat's mode)
-        min_context_tokens: 20000  # only act on prompts at least this large (estimated tokens)
-        min_gap_seconds: 600       # idle time before a chat counts as paused (600 = 10 minutes; for Claude, whose cache lasts 5 minutes, use 240)
-        show_model: false          # add a "using provider model" line to the box, result line and refusal (useful with many models)
+        desktop: warn              # desktop app, web UI: off | warn | block
+        gateway: "off"             # Telegram and other messaging platforms: off | warn | block
+        size_k: 20                 # only act on prompts at least this large, in thousands of tokens
+        pause_m: 10                # idle minutes before a chat counts as paused (minimum 1)
         display_on_success: false  # show the result line when the cache was kept (loss and unknown always show)
-        max_observations: 10000    # history rows kept; minimum 1000, trimmed once 10% over
