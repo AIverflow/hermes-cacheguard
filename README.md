@@ -21,17 +21,13 @@ See [Get more from your cache](docs/guide.md#get-more-from-your-cache).
 
 Needs Hermes 0.22.3 or newer. 0.22.2 builds from after 2026-10-18 work too; older ones show no result lines.
 
-Another profile: add `-p <profile>` after `hermes` in every command below, and use `~/.hermes/profiles/<profile>/` instead of `~/.hermes/`.
-
-Telegram and other messaging apps: cacheguard is off there by default. Turn it on with `/cacheguard setup gateway warn` (or `block`).
-
-### With Hermes
-
     hermes plugins install https://github.com/AIverflow/hermes-cacheguard.git --enable
 
 Then [restart the gateway](#restart-the-gateway) and start a new chat.
 
-### With git
+Another profile: add `-p <profile>` after `hermes` in every command here, and use `~/.hermes/profiles/<profile>/` instead of `~/.hermes/`.
+
+### Or with git
 
     git clone https://github.com/AIverflow/hermes-cacheguard.git ~/.hermes/plugins/cacheguard
     hermes plugins enable cacheguard
@@ -51,10 +47,6 @@ If a Hermes gateway runs, every chat runs its plugins inside it, even in the ter
 
     hermes gateway restart                   # service set up with `hermes gateway install`
     sudo systemctl restart hermes-gateway    # system service (`hermes gateway restart` does not restart it)
-
-Started by hand with `hermes gateway run`: press Ctrl+C in its terminal, then run `hermes gateway run` again.
-
-Not sure whether one runs: `hermes gateway status`. No gateway: a new chat is enough. The gateway takes a minute or so to start; an open chat reconnects by itself.
 
 ## Quick setup
 
