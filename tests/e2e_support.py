@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -28,8 +29,18 @@ def hermes_python():
     launcher = shutil.which("hermes")
     if launcher is None or not AGENT_DIR.exists():
         pytest.skip("installed Hermes required for e2e tests")
+    # The venv's Python, not the bare store Python: Hermes now runs CLI turns in a gateway child
+    # started with the same interpreter, and the bare one refuses to boot under a temp HERMES_HOME.
     try:
-        return json.loads(subprocess.check_output([launcher, "--print-runtime-command"], text=True, timeout=20))[0]
+        store = json.loads(subprocess.check_output([launcher, "--print-runtime-command"], text=True, timeout=20))[0]
+        venv = subprocess.check_output([store, "-I", "-c", "import sys; from pathlib import Path; "
+                                        f"sys.path.insert(0, {str(AGENT_DIR)!r}); "
+                                        "from pm.environments import committed_venv; "
+                                        f"print(committed_venv(Path({str(AGENT_DIR)!r})))"],
+                                       text=True, timeout=20).strip()
+        python = Path(venv) / "bin" / "python3"
+        assert python.is_file(), python
+        return str(python)
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"cannot find the Hermes Python: {exc}")
 
@@ -107,7 +118,7 @@ class HermesHome:
         self.write_config(**settings)
 
     def write_config(self, **settings):
-        settings = {"min_gap_seconds": 1, "min_context_tokens": 100, **settings}
+        settings = {"pause_m": 1, "size_k": 0.1, **settings}
         lines = ["model:", "  default: fake-model", "  provider: custom", f"  base_url: {self.provider_url}",
                  "  api_key: fake-key", "plugins:", "  enabled: [cacheguard]", "  entries:", "    cacheguard:",
                  "      settings:"]
@@ -131,7 +142,45 @@ class HermesHome:
         path = self.home / "cacheguard" / "observations.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def age_sessions(self, seconds=120):
+        """Make every saved chat look `seconds` older, so the next call comes after a real pause."""
+        for path in (self.home / "cacheguard" / "sessions").glob("*.json"):
+            rec = json.loads(path.read_text())
+            for key in ("last_api_ts", "cache_touch_ts"):
+                if isinstance(rec.get(key), (int, float)):
+                    rec[key] -= seconds
+            path.write_text(json.dumps(rec))
+
+    def stop_gateways(self):
+        """Stop the gateway children Hermes started for this home (they outlive the CLI call).
+
+        Waits for them to exit: a gateway still shutting down writes into the home after rmtree."""
+        import time
+        mark = f"HERMES_HOME={self.home.resolve()}".encode()
+        pids = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                env = (proc / "environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if mark in env:
+                try:
+                    os.kill(int(proc.name), signal.SIGTERM)
+                    pids.append(int(proc.name))
+                except OSError:
+                    pass
+        deadline = time.time() + 10
+        while pids and time.time() < deadline:
+            pids = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+            time.sleep(0.1)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
     def close(self):
+        self.stop_gateways()
         shutil.rmtree(self.root, ignore_errors=True)
 
 

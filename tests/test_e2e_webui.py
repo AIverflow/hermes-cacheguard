@@ -1,6 +1,7 @@
 """Real hermes-webui (HTTP API only), fake provider, temp home. Opt-in: python3 -m pytest -q -m e2e"""
 import json
 import time
+import urllib.error
 
 import pytest
 
@@ -17,12 +18,21 @@ def _until(fn, what, timeout=20):
     pytest.fail("timed out waiting for " + what)
 
 
+def _start(webui, sid, message):
+    try:
+        return webui.call("/api/chat/start", {"session_id": sid, "message": message}) or True
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            return None
+        raise
+
+
 def test_webui_cacheguard_table_is_fenced(webui):
     obs = webui.home.home / "cacheguard"
     obs.mkdir(exist_ok=True)
     now = time.time()
     rows = [{"ts": now - 100 + i, "session_id": "seed", "model": "custom/fake-model", "api_mode": "chat_completions",
-             "api_request_id": f"seed-{i}", "gap_s": 400, "prompt_tokens": 30000, "cache_read_tokens": 0,
+             "api_request_id": f"seed-{i}", "gap_s": 400, "prompt_tokens": 30000, "cache_read_tokens": 1000,
              "cache_write_tokens": 0, "prev_prompt_tokens": 30000, "cause": None} for i in range(6)]
     (obs / "observations.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     out = webui.call("/api/commands/exec", {"command": "/cacheguard"})["output"]
@@ -43,8 +53,8 @@ def test_webui_block_deny_shows_blocked(webui):
 
     webui.call("/api/chat/start", {"session_id": sid, "message": "hello"})
     _until(lambda: any(m["role"] == "assistant" for m in messages()), "first reply")
-    time.sleep(1.2)  # over the 1 s pause
-    webui.call("/api/chat/start", {"session_id": sid, "message": "second"})
+    webui.home.age_sessions()  # the pause is at least 1 minute: make the first call look 2 minutes old
+    _until(lambda: _start(webui, sid, "second"), "second turn accepted")  # 409 while the first turn ends
     pending = _until(lambda: webui.call("/api/approval/pending?session_id=" + sid).get("pending"), "approval")
     assert "[CACHEGUARD]" in pending["command"]
     webui.call("/api/approval/respond", {"session_id": sid, "choice": "deny", "approval_id": pending["approval_id"]})

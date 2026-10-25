@@ -67,7 +67,7 @@ def run_gateway_contract():
             if (ROOT / name).exists():
                 shutil.copy2(ROOT / name, plugin_dir / name)
         home = Path(os.environ['HERMES_HOME'])
-        (home/'config.yaml').write_text('cacheguard:\n  cli: block\n  gateway: block\n  min_gap_seconds: 300\n  min_context_tokens: 20000\napprovals:\n  timeout: 5\n')
+        (home/'config.yaml').write_text('plugins:\n  entries:\n    cacheguard:\n      settings:\n        cli: block\n        gateway: block\n        pause_m: 5\n        size_k: 20\napprovals:\n  timeout: 5\n')
 
         from gateway.config import GatewayConfig, Platform
         from gateway.run import GatewayRunner
@@ -82,7 +82,7 @@ def run_gateway_contract():
         from hermes_cli.plugin_validate import validate_plugin_dir
         from hermes_cli.plugin_dev import doctor_plugin
         probe_env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
-        validation = validate_plugin_dir(plugin_dir, probe=(Path(sys.executable), probe_env))
+        validation = validate_plugin_dir(plugin_dir, probe=([sys.executable], probe_env))
         assert validation.ok, validation.failures
         doctor = doctor_plugin(plugin_dir)
         assert doctor.ok, doctor.format_text()
@@ -300,16 +300,16 @@ def run_gateway_contract():
         assert 'could not write' not in saved and 'saved to config' in saved
         from hermes_cli.config import read_raw_config
         settings = read_raw_config()['plugins']['entries']['cacheguard']['settings']
-        assert settings['min_gap_seconds'] == 60 and settings['min_context_tokens'] == 2000
+        assert settings['pause_m'] == 1 and settings['size_k'] == 2
         manager.unload()
         manager._load_plugin(manifests[0])
         plugin = manager._plugins[manifests[0].key or manifests[0].name].module
         cfg = plugin._cfg()
-        assert cfg['cli'] == 'block' and cfg['min_gap_seconds'] == 60 and cfg['min_context_tokens'] == 2000
+        assert cfg['cli'] == 'block' and cfg['pause_m'] == 1 and cfg['size_k'] == 2
         before = (home / 'config.yaml').read_bytes()
         for _ in range(3):
             report = plugin._cmd_show()
-            assert 'pause 60s' in report and 'size 2k' in report
+            assert 'pause 1 minute' in report and 'size 2k' in report
         assert (home / 'config.yaml').read_bytes() == before
         manager.unload()
         print('INSTALLED SETUP PERSISTENCE VERIFIED')

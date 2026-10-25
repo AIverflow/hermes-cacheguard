@@ -12,22 +12,22 @@ def test_score_risk_reports_gap_and_floor_independently(env):
     request = {"messages": [{"role": "user", "content": "x" * 100000}]}
     risk = env.plugin.score_risk(
         {"last_api_ts": 100, "prompt_tokens": 5000},
-        {"request": request, "now": 400, "settings": {"min_gap_seconds": 300}},
+        {"request": request, "now": 400, "settings": {"pause_m": 5}},
     )
     assert risk["tokens_at_risk"] >= 20000
     assert risk["factors"] == {"gap_s": 300.0, "window_crossed": True, "floor_crossed": True}
     small = env.plugin.score_risk(
         {"last_api_ts": 100, "prompt_tokens": 5000},
-        {"request": {}, "now": 400, "settings": {"min_gap_seconds": 300}},
+        {"request": {}, "now": 400, "settings": {"pause_m": 5}},
     )
     assert small["tokens_at_risk"] == 5000 and small["factors"]["window_crossed"] is True
     assert small["factors"]["floor_crossed"] is False
 
 
-def test_score_risk_reuses_history_when_request_is_missing_and_fallback_idle(env):
+def test_score_risk_reuses_history_when_request_is_missing(env):
     risk = env.plugin.score_risk(
-        {"prompt_tokens": 25000},
-        {"request": None, "now": 1000, "fallback_last_assistant_ts": 500, "settings": {"min_gap_seconds": 300}},
+        {"last_api_ts": 500, "prompt_tokens": 25000},
+        {"request": None, "now": 1000, "settings": {"pause_m": 5}},
     )
     assert risk == {
         "tokens_at_risk": 25000,
@@ -38,9 +38,9 @@ def test_score_risk_reuses_history_when_request_is_missing_and_fallback_idle(env
 def test_score_risk_uses_settings_overrides(env):
     risk = env.plugin.score_risk(
         {"last_api_ts": 90, "prompt_tokens": 3000},
-        {"request": {}, "now": 100, "settings": {"min_gap_seconds": 10, "min_context_tokens": 2500}},
+        {"request": {}, "now": 200, "settings": {"pause_m": 1, "size_k": 2.5}},
     )
-    assert risk["factors"] == {"gap_s": 10.0, "window_crossed": True, "floor_crossed": True}
+    assert risk["factors"] == {"gap_s": 110.0, "window_crossed": True, "floor_crossed": True}
 
 
 def test_score_risk_estimates_all_provider_prompt_fields(env):
@@ -68,7 +68,7 @@ def test_score_risk_rejects_invalid_numbers_and_ignores_future_session_time(env)
     for bad in (None, -1, float("nan"), float("inf"), True):
         risk = env.plugin.score_risk(
             {"last_api_ts": bad, "prompt_tokens": bad},
-            {"request": None, "now": float("nan"), "fallback_last_assistant_ts": bad, "settings": {}},
+            {"request": None, "now": float("nan"), "settings": {}},
         )
         assert risk == {
             "tokens_at_risk": 0,
@@ -79,10 +79,6 @@ def test_score_risk_rejects_invalid_numbers_and_ignores_future_session_time(env)
         {"request": None, "now": 100, "settings": {}},
     )
     assert future["factors"]["gap_s"] is None and not future["factors"]["window_crossed"]
-    fallback = env.plugin.score_risk(
-        {"last_api_ts": 200}, {"now": 100, "fallback_last_assistant_ts": 40, "settings": {}},
-    )
-    assert fallback["factors"]["gap_s"] == 60.0
 
 
 def test_score_risk_does_not_mutate_inputs(env):

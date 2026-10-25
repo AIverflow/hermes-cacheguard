@@ -27,16 +27,10 @@ def test_bucket_index(env):
 
 
 # ------------------------------------------------------------- formatting --
-@pytest.mark.parametrize("s,out", [(5, "5s"), (89, "89s"), (90, "1min"), (3600, "60min"),
-                                   (5400, "1.5h"), (7200, "2.0h"), (48 * 3600, "2d"), (3 * 86400, "3d")])
-def test_fmt_gap(env, s, out):
-    assert env.plugin._fmt_gap(s) == out
-
-
-def test_warning_prints_nothing_before_the_reply(env):
+def test_warning_shows_nothing_before_the_reply(env):
     seed_session(env, ago=3600)
     run_middleware(env)
-    assert env.printed == [] and env.warned() is not None
+    assert not env.notices and env.warned() is not None
 
 
 def test_confirmation_without_enough_data_has_no_probability(env):
@@ -68,25 +62,14 @@ def _cold_history(plugin, cold, warm, gap=3600):
         })
 
 
-def test_confirmation_shows_chance_with_enough_data(env):
+def test_confirmation_shows_counts_with_enough_data(env):
     env.config["cli"] = "block"
     seed_session(env, ago=3600)
     _cold_history(env.plugin, cold=6, warm=4)
     prompts = []
     env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
     run_middleware(env)
-    assert "Paused 60 minutes · ~" in prompts[0] and "tokens may reload · chance of loss 60%" in prompts[0]
-
-
-@pytest.mark.parametrize("show,expected", [(False, False), (True, True)])
-def test_show_model_names_model_in_confirmation_and_result(env, show, expected):
-    env.config.update(cli="block", show_model=show)
-    seed_session(env, ago=3600)
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "once")[1]
-    run_middleware(env)
-    assert ("\nusing p m1" in prompts[0]) is expected
-    assert ("\nusing p m1" in env.plugin._PENDING.get("s1", "")) is expected
+    assert "Paused 60 minutes · ~" in prompts[0] and "tokens may be rebilled · lost 6 of 10 similar pauses" in prompts[0]
 
 
 # -------------------------------------------------------------- idle trigger
@@ -94,7 +77,7 @@ def test_idle_trigger_warns_and_sends(env):
     seed_session(env, ago=3600)
     out, called, sentinel = run_middleware(env)
     assert called and out is sentinel
-    assert env.printed == [] and env.warned() is not None
+    assert not env.notices and env.warned() is not None
 
 
 def test_gateway_default_off_still_records_usage(env):
@@ -107,7 +90,7 @@ def test_gateway_default_off_still_records_usage(env):
 @pytest.mark.parametrize("platform,setting", [("cli", "cli"), ("telegram", "gateway")])
 @pytest.mark.parametrize("mode", ["off", "warn", "block"])
 def test_surface_modes_gate_idle_trigger(env, monkeypatch, platform, setting, mode):
-    env.config.update({setting: mode, "min_context_tokens": 1000})
+    env.config.update({setting: mode, "size_k": 1})
     seed_session(env, ago=3600)
     if mode == "block" and platform == "cli":
         monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
@@ -130,7 +113,7 @@ def test_surface_modes_gate_idle_trigger(env, monkeypatch, platform, setting, mo
 @pytest.mark.parametrize("platform", ["cli", "telegram"])
 def test_bot_chat_is_pure_pass_through(env, platform, mode):
     env.bot_managed = True
-    env.config.update(cli=mode, gateway=mode, model_change=mode, min_context_tokens=1000)
+    env.config.update(cli=mode, gateway=mode, size_k=1)
     env.approval = lambda *a, **k: pytest.fail("Bot Chat must never prompt")
     con = env.db()
     con.execute("INSERT INTO sessions(id,title) VALUES('s1','Bot Chat')")
@@ -149,7 +132,7 @@ def test_bot_chat_is_pure_pass_through(env, platform, mode):
 
 def test_ordinary_gateway_chat_on_managed_profile_uses_gateway_mode(env, monkeypatch):
     env.bot_managed = True
-    env.config.update(cli="off", gateway="block", min_context_tokens=1000)
+    env.config.update(cli="off", gateway="block", size_k=1)
     con = env.db()
     con.execute("INSERT INTO sessions(id,title) VALUES('s1','ordinary chat')")
     con.commit()
@@ -164,12 +147,11 @@ def test_ordinary_gateway_chat_on_managed_profile_uses_gateway_mode(env, monkeyp
 
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_gateway_warn_mode_is_nonblocking(env, trigger):
-    env.config.update(gateway="warn", cli="off", min_context_tokens=1000)
+    env.config.update(gateway="warn", cli="off", size_k=1)
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
         seed_session(env, ago=10, model="p/old")
-        env.config["model_change"] = "warn"
     out, called, sentinel = run_middleware(env, platform="telegram", model="new")
     assert called and out is sentinel and env.warned() is not None
 
@@ -218,7 +200,7 @@ def test_bot_chat_identity_reads_active_profile_database(env, monkeypatch, tmp_p
 
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_gateway_block_mode_retains_approval_for_both_triggers(env, monkeypatch, trigger):
-    env.config.update(gateway="block", cli="off", model_change="block")
+    env.config.update(gateway="block", cli="off")
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
@@ -233,7 +215,7 @@ def test_gateway_block_mode_retains_approval_for_both_triggers(env, monkeypatch,
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_tui_block_uses_gateway_approval_when_no_cli_callback(env, monkeypatch, trigger):
     # The TUI registers no CLI approval callback; it asks through the gateway approval queue.
-    env.config.update(cli="block", model_change="block", min_context_tokens=1000)
+    env.config.update(cli="block", size_k=1)
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
@@ -251,7 +233,7 @@ MINTED = "3f2b8c1e-7a4d-4e6b-9c1a-0d5e2f8a1b34"  # Hermes mints a uuid4 when run
 
 def _resume_quiet(env, task_id=MINTED, **extra):
     # `hermes chat -c NAME -Q` / `hermes -z -c NAME` / Bot Chat: resumed session, minted task id.
-    env.config.update(min_context_tokens=1000)
+    env.config.update(size_k=1)
     seed_session(env, ago=3600)
     extra.setdefault("api_request_id", f"s1:{task_id}:abcd1234:api:1")
     return run_middleware(env, task_id=task_id, **extra)
@@ -287,7 +269,7 @@ def test_minted_task_id_with_foreign_request_id_stays_auxiliary(env):
 def test_single_query_block_warns_without_waiting_for_a_prompt(env, monkeypatch, trigger):
     # `chat -Q`, `--oneshot` and `-z` have no screen: the CLI callback would wait out the timeout.
     monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
-    env.config.update(cli="block", model_change="block", min_context_tokens=1000)
+    env.config.update(cli="block", size_k=1)
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
@@ -300,7 +282,7 @@ def test_single_query_block_warns_without_waiting_for_a_prompt(env, monkeypatch,
 
 
 def test_tui_block_without_any_approval_path_falls_back_to_warn(env, monkeypatch):
-    env.config.update(cli="block", min_context_tokens=1000)
+    env.config.update(cli="block", size_k=1)
     seed_session(env, ago=3600)
     monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
     monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: None)
@@ -310,7 +292,7 @@ def test_tui_block_without_any_approval_path_falls_back_to_warn(env, monkeypatch
 
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_surface_off_cannot_be_reenabled_by_model_change(env, trigger):
-    env.config.update(gateway="off", cli="block", model_change="block")
+    env.config.update(gateway="off", cli="block")
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
@@ -337,13 +319,6 @@ def test_no_trigger(env, case):
     assert env.warned() is None
 
 
-def test_disabled(env):
-    env.config["enabled"] = False
-    seed_session(env, ago=3600)
-    out, called, _ = run_middleware(env)
-    assert called and env.warned() is None
-
-
 def test_last_real_prompt_tokens_raise_floor(env):
     seed_session(env, ago=3600, prompt_tokens=100000)
     env.config["cli"] = "block"
@@ -357,7 +332,7 @@ def test_last_real_prompt_tokens_raise_floor(env):
 @pytest.mark.parametrize("mode", ["off", "warn", "block"])
 def test_model_change_off_warn_block(env, mode):
     seed_session(env, ago=10, model="p/old")  # short gap: only model-change can fire
-    env.config["model_change"] = mode
+    env.config["cli"] = mode
     env.approval = lambda *a, **k: "deny"
     out, called, sentinel = run_middleware(env, model="new")
     if mode == "block":
@@ -365,20 +340,18 @@ def test_model_change_off_warn_block(env, mode):
     else:
         assert called and out is sentinel
         if mode == "warn":
-            assert "model changed p/old → p/new" in env.warned()
+            assert "model changed" in env.warned()
         else:
             assert env.warned() is None
 
 
 def test_model_change_same_model_silent(env):
-    env.config["model_change"] = "warn"
     seed_session(env, ago=10, model="p/m1")
     run_middleware(env, model="m1")
     assert env.warned() is None
 
 
 def test_model_change_small_context_silent(env):
-    env.config["model_change"] = "warn"
     seed_session(env, ago=10, model="p/old")
     run_middleware(env, model="new", request={"messages": [], "tools": []})
     assert env.warned() is None
@@ -423,55 +396,8 @@ def test_block_timeout_denies(env):
     assert not called and "message not sent" in out.choices[0].message.content
 
 
-@pytest.mark.parametrize("answer", ["deny", "timeout"])
-def test_repeated_denial_requires_confirmation_again(env, answer):
-    env.config.update(cli="block", min_context_tokens=1000)
-    con = env.db()
-    con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("old", "assistant", "real reply", time.time() - 7200))
-    con.commit()
-    con.close()
-    prompts = []
-
-    def approval(command, desc, **kw):
-        prompts.append((command, desc, kw))
-        return answer
-
-    env.approval = approval
-    for _ in range(2):
-        out, called, _ = run_middleware(env, session_id="old")
-        assert not called and "message not sent" in out.choices[0].message.content
-        con = env.db()
-        con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                    ("old", "assistant", out.choices[0].message.content, time.time()))
-        con.commit()
-        con.close()
-    assert len(prompts) == 2
-
-
-def test_repeated_denial_then_allow_once_sends_once(env):
-    env.config.update(cli="block", min_context_tokens=1000)
-    con = env.db()
-    con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("old", "assistant", "real reply", time.time() - 7200))
-    con.commit()
-    con.close()
-    answers = iter(["deny", "once"])
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), next(answers))[1]
-    first, called, _ = run_middleware(env, session_id="old")
-    assert not called and "message not sent" in first.choices[0].message.content
-    con = env.db()
-    con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("old", "assistant", first.choices[0].message.content, time.time()))
-    con.commit()
-    con.close()
-    _, called, _ = run_middleware(env, session_id="old")
-    assert called and len(prompts) == 2
-
-
 def test_repeated_denial_still_prompts_for_plugin_tracked_session(env):
-    env.config.update(cli="block", min_context_tokens=1000)
+    env.config.update(cli="block", size_k=1)
     seed_session(env, ago=7200)
     prompts = []
     env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
@@ -482,7 +408,7 @@ def test_repeated_denial_still_prompts_for_plugin_tracked_session(env):
 
 
 def _box_broke_notices(env):
-    return [t for t in env.printed if "the Send/Cancel box failed" in t]
+    return [t for t in env.notices if "the cacheguard box failed" in t]
 
 
 def _run_counting(env, platform="cli", session_id="s1"):
@@ -516,11 +442,11 @@ def test_block_callback_raises_sends_and_switches_the_box_off(env):
     _block_setup(env, RuntimeError("boom"))
     out, calls, sentinel = _run_counting(env)
     assert calls == 1 and out is sentinel
-    assert env.printed.count(
-        "[CACHEGUARD] the Send/Cancel box failed, so messages now go out with a warning "
+    assert env.notices.count(
+        "the cacheguard box failed, so messages now go out with a warning "
         "until Hermes restarts. Details: /cacheguard") == 1
     assert env.plugin._H["box_failed"] == "RuntimeError"
-    assert "Send/Cancel box failed this session" in env.plugin._health_text()
+    assert "cacheguard box failed this session" in env.plugin._health_text()
 
 
 def test_after_a_box_crash_later_guarded_messages_warn_and_the_notice_shows_once(env):
@@ -643,11 +569,18 @@ def _gateway_block(env, monkeypatch, decision):
     wait._await_gateway_decision = await_decision
     monkeypatch.setitem(sys.modules, "tools.approval_gateway_wait", wait)
     monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-    env.config.update(cli="off", gateway="block", min_context_tokens=1000)
+    env.config.update(cli="off", gateway="block", size_k=1)
     seed_session(env, ago=3600)
 
 
-@pytest.mark.parametrize("decision", [None, "cancel", "x", ["resolved"], {}, {"foo": 1}, RuntimeError("wait crashed")])
+@pytest.mark.parametrize("decision", [
+    None, "cancel", "x", ["resolved"], {}, {"foo": 1}, RuntimeError("wait crashed"),
+    {"resolved": True, "choice": "new-value"},
+    {"resolved": None, "choice": None},
+    {"resolved": "yes", "choice": "once"},
+    {"resolved": False, "choice": "once"},
+    {"resolved": False, "choice": "deny"},
+])
 def test_gateway_bad_decision_or_error_sends_once_and_switches_the_box_off(env, monkeypatch, decision):
     _gateway_block(env, monkeypatch, decision)
     out, calls, sentinel = _run_counting(env, platform="telegram")
@@ -726,7 +659,7 @@ def test_block_without_callback_falls_back_to_warn(env):
     env.approval = None
     out, called, sentinel = run_middleware(env)
     assert called and out is sentinel and env.warned() is not None
-    assert "[CACHEGUARD]" in env.plugin._PENDING["s1"]
+    assert env.plugin._PENDING["s1"].startswith("CGUARD ")
 
 
 def test_block_non_cli_never_prompts(env):
@@ -740,78 +673,27 @@ def test_missing_next_call_returns_request(env):
     assert env.plugin._on_llm_execution(request=req) is req
 
 
-# ------------------------------------------------------------ DB fallbacks --
-def test_last_assistant_ts_from_db(env):
-    con = env.db()
-    con.executemany(
-        "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-        [("s1", "assistant", "a", 100.0), ("s1", "assistant", "b", 200.0),
-         ("s1", "user", "c", 300.0), ("s2", "assistant", "d", 999.0)],
-    )
-    con.commit()
-    con.close()
-    assert env.plugin._last_assistant_ts("s1") == 200.0
-    assert env.plugin._last_assistant_ts("nope") is None
-    assert env.plugin._last_assistant_ts("") is None
-
-
-def test_last_assistant_ts_ignores_denial_but_keeps_null_content(env):
-    con = env.db()
-    con.executemany(
-        "INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-        [("s1", "assistant", "real", 100.0), ("s1", "assistant", None, 150.0),
-         ("s1", "assistant", "cacheguard: message NOT sent — cold", 200.0)],
-    )
-    con.commit()
-    con.close()
-    assert env.plugin._last_assistant_ts("s1") == 150.0
-
-
-def test_last_assistant_ts_missing_db(env):
-    assert env.plugin._last_assistant_ts("s1") is None
-
-
-def test_idle_trigger_uses_db_fallback(env):
+# ------------------------------------------------- own session file only --
+def test_unknown_session_means_no_box_even_when_hermes_has_history(env):
     con = env.db()
     con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s1','assistant','a',?)",
                 (time.time() - 7200,))
-    con.commit()
-    con.close()
-    env.config["cli"] = "block"
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
-    run_middleware(env)
-    assert "120 minutes" in prompts[0]
-
-
-def test_last_model_db_fallback(env):
-    con = env.db()
-    con.executemany(
-        "INSERT INTO session_model_usage VALUES (?,?,?,?,?)",
-        [("s1", "", "deepinfra", "old", 1.0),
-         ("s1", "", "openrouter", "newest", 5.0),
-         ("s1", "", "x", "unknown", 9.0),       # ignored
-         ("s1", "title", "x", "aux", 9.0)],      # auxiliary task, ignored
-    )
-    con.commit()
-    con.close()
-    assert env.plugin._last_model("s1") == "openrouter/newest"
-    assert env.plugin._last_model("nope") is None
-
-
-def test_last_model_prefers_sessions_file(env):
-    seed_session(env, model="a/b")
-    assert env.plugin._last_model("s1") == "a/b"
-
-
-def test_model_change_via_db(env):
-    env.config["model_change"] = "warn"
-    con = env.db()
     con.execute("INSERT INTO session_model_usage VALUES ('s1','','deepinfra','old',1.0)")
     con.commit()
     con.close()
-    run_middleware(env, model="new", provider="p")
-    assert "model changed deepinfra/old → p/new" in env.warned()
+    env.config.update(cli="block", size_k=1)
+    env.approval = lambda *a, **k: pytest.fail("no session file: no box")
+    out, called, sentinel = run_middleware(env, model="new", provider="p")
+    assert called and out is sentinel and env.warned() is None
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", ""])
+def test_broken_session_file_means_no_box(env, content):
+    env.config.update(cli="block", size_k=1)
+    env.plugin._session_file("s1").write_text(content)
+    env.approval = lambda *a, **k: pytest.fail("broken session file: no box")
+    out, called, sentinel = run_middleware(env, model="new", provider="p")
+    assert called and out is sentinel and env.warned() is None
 
 
 # ------------------------------------------------------ observation hook ---
@@ -825,45 +707,54 @@ def _send_observed(env, **kwargs):
     return env.plugin._on_llm_execution(**kwargs)
 
 
-
 def test_load_observations_skips_garbage(env):
-    env.plugin._obs_path().write_text('not json\n\n{"model": "m", "gap_s": 1}\n')
+    env.plugin._obs_path().write_text("not json\n\n" + json.dumps(_journal_row("s", ts=1.0)) + "\n")
     assert len(env.plugin._load_observations()) == 1
 
 
 def test_load_observations_skips_malformed_rows_and_keeps_valid_history(env):
-    env.plugin._obs_path().write_text(
-        '[]\n{"model":"bad","gap_s":"nan"}\n'
-        '{"model":"valid","gap_s":1,"cold":true}\n'
-    )
-    assert env.plugin._load_observations() == [{"model": "valid", "gap_s": 1, "cold": True}]
+    valid = _journal_row("s", ts=1.0)
+    env.plugin._obs_path().write_text('[]\n{"model":"bad","gap_s":"nan"}\n' + json.dumps(valid) + "\n")
+    assert env.plugin._load_observations() == [valid]
 
 
 def test_load_observations_skips_unbounded_integer_without_losing_valid_row(env):
     huge = "9" * 1000
-    env.plugin._obs_path().write_text(
-        '{"model":"bad","gap_s":' + huge + '}\n'
-        '{"model":"valid","gap_s":1,"cold":true}\n'
-    )
-    assert env.plugin._load_observations() == [{"model": "valid", "gap_s": 1, "cold": True}]
+    valid = _journal_row("s", ts=1.0)
+    env.plugin._obs_path().write_text('{"model":"bad","gap_s":' + huge + '}\n' + json.dumps(valid) + "\n")
+    assert env.plugin._load_observations() == [valid]
 
 
 def test_load_observations_skips_explicit_null_timestamp(env):
+    valid = _journal_row("s", ts=1.0)
     env.plugin._obs_path().write_text(
-        '{"model":"bad","gap_s":1,"ts":null}\n'
-        '{"model":"valid","gap_s":1,"cold":true}\n'
-    )
-    assert env.plugin._load_observations() == [{"model": "valid", "gap_s": 1, "cold": True}]
+        json.dumps(_journal_row("s", ts=None)) + "\n" + json.dumps(valid) + "\n")
+    assert env.plugin._load_observations() == [valid]
+
+
+def test_read_observations_does_not_reuse_another_files_rows(env, tmp_path, monkeypatch):
+    first, second = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    first.write_text(json.dumps(_journal_row("a", ts=1.0)) + "\n")
+    second.write_text(json.dumps(_journal_row("b", ts=1.0)) + "\n")
+    os.utime(second, ns=(first.stat().st_atime_ns, first.stat().st_mtime_ns))
+    monkeypatch.setattr(env.plugin, "_obs_path", lambda: first)
+    assert env.plugin._read_observations()[0]["session_id"] == "a"
+    monkeypatch.setattr(env.plugin, "_obs_path", lambda: second)
+    assert env.plugin._read_observations()[0]["session_id"] == "b"
+
+
+def test_rows_without_the_current_fields_are_skipped(env):
+    valid = _journal_row("s", ts=1.0)
+    old = {"model": "p/m", "gap_s": 1, "cold": True}
+    env.plugin._obs_path().write_text(json.dumps(old) + "\n" + json.dumps(valid) + "\n")
+    assert env.plugin._load_observations() == [valid]
+    assert "invalid observation rows skipped" in env.plugin._H["data_errors"]
 
 
 def test_malformed_observation_cannot_bypass_block_confirmation(env):
-    env.config.update(cli="block", min_context_tokens=1000)
-    env.plugin._obs_path().write_text('[]\n{"model":"ok","gap_s":1,"cold":false}\n')
-    con = env.db()
-    con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("old", "assistant", "real", time.time() - 7200))
-    con.commit()
-    con.close()
+    env.config.update(cli="block", size_k=1)
+    env.plugin._obs_path().write_text("[]\n" + json.dumps(_journal_row("x", ts=1.0)) + "\n")
+    seed_session(env, session_id="old", ago=7200)
     prompts = []
     env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
     out, called, _ = run_middleware(env, session_id="old")
@@ -879,10 +770,11 @@ def test_cmd_empty_table(env):
     assert out.count("(no observations yet)") == 1
     assert "predicted" not in out and "probability" not in out
     assert "Loss = at least 30%" not in out and "Each bucket is separate" not in out
-    assert "2/5 = losses/calls" not in out and "/cacheguard set " not in out
+    assert "2/5 = losses/calls" not in out
     assert out.splitlines()[0].startswith("cacheguard  ·  cli warn  ·  desktop warn  ·  gateway off  ·  pause ")
     assert "cli (terminal" not in out and "gateway (Telegram" not in out
-    assert out.splitlines()[2].startswith("setup: /cacheguard setup all block 10 20") and out.splitlines()[3] == "help: /cacheguard help"
+    assert out.splitlines()[2].startswith("setup: /cacheguard setup all block 10 20") and out.splitlines()[4] == "help: /cacheguard help"
+    assert out.splitlines()[3] == "set: /cacheguard set pause_m 1  (change only the pause, here 1 minute)"
     assert "settings: /cacheguard setup" not in out and "health:" not in out
 
 
@@ -989,10 +881,33 @@ def test_register_without_llm_execution_middleware_still_loads(env):
 
     env.plugin.register(Ctx())
     assert reg == {"hook": ["transform_llm_output"], "cmd": ["cacheguard"]}
-    lines = [t for t in env.printed if t == "[CACHEGUARD] cacheguard is off: it could not start."]
+    lines = [t for t in env.notices if t == "cacheguard is off: it could not start."]
     assert len(lines) == 1
     assert "llm_execution" not in lines[0] and "AttributeError" not in lines[0]
     assert "AttributeError: renamed" in env.plugin._health_text()  # the detail stays in /cacheguard
+
+
+@pytest.mark.parametrize("hook, effect", [
+    ("llm_request", "cacheguard lines may reach the model."),
+    ("transform_llm_output", "no result lines."),
+])
+def test_health_names_a_hook_that_failed_to_register(env, hook, effect):
+    class Ctx:
+        def register_middleware(self, name, fn):
+            if name == hook:
+                raise RuntimeError("refused")
+
+        def register_hook(self, name, fn):
+            if name == hook:
+                raise RuntimeError("refused")
+
+        def register_command(self, name, fn, **kw):
+            pass
+
+    env.plugin.register(Ctx())  # never raises
+    text = env.plugin._health_text()
+    assert f"{hook}: RuntimeError: refused ({effect})" in text
+    assert "health: degraded" in text
 
 
 def test_wrong_type_in_guard_sends_is_ignored(env):
@@ -1007,7 +922,7 @@ def test_wrong_type_in_guard_sends_is_ignored(env):
 
 def test_send_time_in_the_future_does_not_hold_the_cooldown(env):
     payload = {"session_id": "s1", "provider": "p", "model": "m1"}
-    cfg = {"min_gap_seconds": 300}
+    cfg = {"pause_m": 5}
     now = time.time()
     rec = {"guard_sends": {env.plugin._domain_key(payload): now + 86400}}  # clock went back
     assert not env.plugin._cooldown_active(rec, payload, cfg, now)
@@ -1015,18 +930,12 @@ def test_send_time_in_the_future_does_not_hold_the_cooldown(env):
     assert env.plugin._cooldown_active(rec, payload, cfg, now)
 
 
-def test_last_time_in_the_future_uses_state_db(env):
+def test_last_time_in_the_future_means_no_box(env):
     env.config["cli"] = "block"
-    seed_session(env, ago=-86400)  # clock went back: stored time is a day ahead
-    con = env.db()
-    con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s1','assistant','a',?)",
-                (time.time() - 7200,))
-    con.commit()
-    con.close()
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
-    out, called, _ = run_middleware(env)
-    assert not called and "120 minutes" in prompts[0]
+    seed_session(env, ago=-86400)  # clock went back: stored time is a day ahead, the pause is unknown
+    env.approval = lambda *a, **k: pytest.fail("pause unknown: no box")
+    out, called, sentinel = run_middleware(env)
+    assert called and out is sentinel
 
 
 # ------------------------------------------------------ /cacheguard set -----
@@ -1047,21 +956,13 @@ def _with_ctx(env, **kw):
     return ctx
 
 
-def test_set_official_settings_override_legacy_block(env):
-    env.config = {"cli": "warn", "min_gap_seconds": 100}
-    env.settings = {"cli": "block"}
-    cfg = env.plugin._cfg()
-    assert cfg["cli"] == "block" and cfg["min_gap_seconds"] == 100
-
-
 @pytest.mark.parametrize("args,expected", [
     ("cli block", ("cli", "block")),
-    ("model_change off", ("model_change", "off")),
     ("gateway warn", ("gateway", "warn")),
     ("desktop block", ("desktop", "block")),
-    ("minutes 10", ("min_gap_seconds", 600)),
-    ("minutes 1", ("min_gap_seconds", 60)),
-    ("tokens 30", ("min_context_tokens", 30000)),
+    ("pause_m 10", ("pause_m", 10)),
+    ("pause_m 1", ("pause_m", 1)),
+    ("size_k 30", ("size_k", 30)),
 ])
 def test_set_writes_and_takes_effect(env, args, expected):
     ctx = _with_ctx(env)
@@ -1070,52 +971,77 @@ def test_set_writes_and_takes_effect(env, args, expected):
     assert env.plugin._cfg()[expected[0]] == expected[1]
 
 
-@pytest.mark.parametrize("args", ["", "cli", "cli maybe", "bot warn", "gateway maybe", "minutes abc", "minutes -3", "tokens", "bogus 1", "cli block extra"])
+@pytest.mark.parametrize("args", ["", "cli", "cli maybe", "bot warn", "gateway maybe", "pause_m abc", "pause_m -3", "size_k", "bogus 1", "minutes 10", "minutes 1", "pause_minutes 10", "tokens 30", "cli block extra"])
 def test_set_rejects_bad_input_without_writing(env, args):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show(("set " + args).strip())
     assert "usage:" in out and ctx.calls == []
 
 
-@pytest.mark.parametrize("args", ["minutes 0", "minutes 0.5"])
+def test_set_minutes_is_no_longer_a_name(env):
+    ctx = _with_ctx(env)
+    out = env.plugin._cmd_show("set minutes 5")
+    assert out == env.plugin._SET_USAGE and ctx.calls == []
+
+
+def test_setup_writes_pause_m_key(env):
+    ctx = _with_ctx(env)
+    out = env.plugin._cmd_show("setup all block 4 20")
+    assert ("pause_m", 4) in ctx.calls and "pause ≥ 4 min" in out
+    assert env.plugin._cfg()["pause_m"] == 4
+
+
+def test_old_pause_minutes_config_key_is_ignored(env):
+    env.settings = {"pause_minutes": 3}
+    assert env.plugin._cfg()["pause_m"] == 10
+
+
+def test_pause_m_invalid_in_config_falls_back_to_default(env):
+    env.settings = {"pause_m": 0.5}
+    assert env.plugin._cfg()["pause_m"] == 10
+    assert "invalid pause_m" in env.plugin._health_text()
+
+
+@pytest.mark.parametrize("args", ["pause_m 0", "pause_m 0.5"])
 def test_set_minutes_below_one_is_refused(env, args):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("set " + args)
-    assert out.startswith("cacheguard: minutes must be a number >= 1.") and "usage:" in out and ctx.calls == []
+    assert out.startswith("cacheguard: pause_m must be a number >= 1.") and "usage:" in out and ctx.calls == []
 
 
 @pytest.mark.parametrize("args", [
-    "minutes nan", "minutes inf", "minutes -inf", "minutes 1e308",
-    "tokens nan", "tokens inf", "tokens -inf", "tokens 1e308",
+    "pause_m nan", "pause_m inf", "pause_m -inf", "pause_m 1e308",
+    "size_k nan", "size_k inf", "size_k -inf", "size_k 1e308",
 ])
 def test_set_rejects_nonfinite_and_overflow_without_writing(env, args):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("set " + args)
-    assert ("must be a finite number" in out or "too large" in out) and ctx.calls == []
+    assert "must be a number" in out or "is in thousands" in out
+    assert ctx.calls == []
 
 
-def test_set_and_setup_refuse_tokens_above_2000_thousands(env):
+def test_set_and_setup_refuse_size_above_2000_thousands(env):
     ctx = _with_ctx(env)
-    msg = "cacheguard: tokens is in thousands: 20 = 20k. Max 2000."
-    for cmd in ("set tokens 20000", "set tokens 2001", "setup all block 10 20000"):
+    msg = "cacheguard: size_k is in thousands: 20 = 20k. A number from 0 to 2000."
+    for cmd in ("set size_k 20000", "set size_k 2001", "setup all block 10 20000"):
         out = env.plugin._cmd_show(cmd)
         assert msg in out and "usage:" in out and ctx.calls == [], cmd
-    assert "saved" in env.plugin._cmd_show("set tokens 2000")
-    assert ctx.calls == [("min_context_tokens", 2_000_000)]
+    assert "saved" in env.plugin._cmd_show("set size_k 2000")
+    assert ctx.calls == [("size_k", 2000)]
 
 
 def test_setup_rejects_nonfinite_values_before_any_write(env):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup all block nan 30")
-    assert "must be a finite number" in out and ctx.calls == []
+    assert "pause_m must be a number >= 1" in out and ctx.calls == []
 
 
 def test_invalid_config_uses_visible_defaults_and_keeps_block_mode(env):
     env.config = {
-        "cli": "block", "min_gap_seconds": "oops",
+        "cli": "block", "pause_m": "oops",
     }
     cfg = env.plugin._cfg()
-    assert cfg["cli"] == "block" and cfg["min_gap_seconds"] == 600
+    assert cfg["cli"] == "block" and cfg["pause_m"] == 10
     assert "health: degraded" in env.plugin._health_text()
 
 
@@ -1130,7 +1056,7 @@ def test_malformed_config_section_is_reported(env, monkeypatch):
     import sys
 
     monkeypatch.setattr(sys.modules["hermes_cli.config"], "read_raw_config",
-                        lambda: {"cacheguard": []})
+                        lambda: {"plugins": {"entries": {"cacheguard": {"settings": []}}}})
     cfg = env.plugin._cfg()
     assert cfg["cli"] == "warn"
     assert "health: degraded" in env.plugin._health_text()
@@ -1139,7 +1065,7 @@ def test_malformed_config_section_is_reported(env, monkeypatch):
 def test_config_degraded_status_survives_health_refresh(env, monkeypatch):
     import sys
 
-    env.config["min_gap_seconds"] = "bad"
+    env.config["pause_m"] = "bad"
     env.plugin._cfg()
     monkeypatch.setattr(env.plugin, "_health", lambda: {
         name: (True, "") for name in ("approval_cb", "config_api", "state_db", "hermes_version")
@@ -1169,18 +1095,13 @@ def test_absent_state_db_features_fall_back_quietly(env):
     assert not (env.home / "state.db").exists()
     env.plugin._run_health()
     assert env.plugin._is_bot_chat("s1") is False
-    assert env.plugin._last_assistant_ts("s1") is None
-    assert env.plugin._last_model("s1") is None
 
 
 def test_existing_state_db_with_broken_schema_is_still_degraded(env):
     import sqlite3
 
     con = sqlite3.connect(env.home / "state.db")
-    con.executescript(
-        "CREATE TABLE messages (id INTEGER PRIMARY KEY);"
-        "CREATE TABLE session_model_usage (session_id TEXT, task TEXT, billing_provider TEXT, model TEXT, last_seen REAL);"
-    )
+    con.executescript("CREATE TABLE messages (id INTEGER PRIMARY KEY);")
     con.commit()
     con.close()
     ok, detail = env.plugin._health()["state_db"]
@@ -1190,15 +1111,10 @@ def test_existing_state_db_with_broken_schema_is_still_degraded(env):
 
 
 def test_unbounded_config_number_falls_back_without_raising(env):
-    env.config["min_gap_seconds"] = 10 ** 1000
+    env.config["pause_m"] = 10 ** 1000
     cfg = env.plugin._cfg()
-    assert cfg["min_gap_seconds"] == 600
+    assert cfg["pause_m"] == 10
     assert "health: degraded" in env.plugin._health_text()
-
-
-def test_false_enabled_setting_remains_valid(env):
-    env.config["enabled"] = False
-    assert env.plugin._cfg()["enabled"] is False
 
 
 def test_set_write_failure_is_reported_not_raised(env):
@@ -1222,23 +1138,10 @@ def test_set_without_ctx_writes_config(env, monkeypatch):
     assert "saved" in out and saved == [("cacheguard", ("cli",), "block")]
 
 
-def test_off_rejects_extra_arguments_without_writing(env):
-    ctx = _with_ctx(env)
-    assert env.plugin._cmd_show("off 10 20") == "usage: /cacheguard off"
-    assert env.plugin._cmd_show("off block") == "usage: /cacheguard off"
-    assert ctx.calls == []
-
-
-def test_off_turns_all_groups_off(env):
-    ctx = _with_ctx(env)
-    assert "saved" in env.plugin._cmd_show("off")
-    assert sorted(ctx.calls) == [("cli", "off"), ("desktop", "off"), ("gateway", "off")]
-
-
 # ------------------------------------------------ terminal: hermes cacheguard ---
 def _cli_args(**kw):
     base = {"cache_guard_action": None, "group": None, "mode": None, "minutes": None,
-            "tokens": None, "cache_guard_help": lambda: print("HELP")}
+            "tokens": None}
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -1252,8 +1155,8 @@ def test_cli_setup_all_block_writes_every_group_and_timing(env, monkeypatch, cap
     assert ("cacheguard", ("cli",), "block") in saved
     assert ("cacheguard", ("desktop",), "block") in saved
     assert ("cacheguard", ("gateway",), "block") in saved
-    assert ("cacheguard", ("min_gap_seconds",), 600) in saved
-    assert ("cacheguard", ("min_context_tokens",), 20000) in saved
+    assert ("cacheguard", ("pause_m",), 10) in saved
+    assert ("cacheguard", ("size_k",), 20) in saved
     assert "saved to config" in capsys.readouterr().out
 
 
@@ -1263,13 +1166,6 @@ def test_cli_setup_one_group_without_timing(env, monkeypatch, capsys):
     rc = env.plugin._cli_handler(_cli_args(cache_guard_action="setup", group="gateway", mode="warn"))
     assert rc == 0 and saved == [("cacheguard", ("gateway",), "warn")]
     assert "gateway = warn" in capsys.readouterr().out
-
-
-def test_cli_off_is_setup_all_off(env, monkeypatch, capsys):
-    saved = _fake_settings_writer(monkeypatch)
-    env.plugin._CTX = None
-    assert env.plugin._cli_handler(_cli_args(cache_guard_action="off")) == 0
-    assert sorted(saved) == sorted(("cacheguard", (g,), "off") for g in ("cli", "desktop", "gateway"))
 
 
 @pytest.mark.parametrize("kw", [
@@ -1288,9 +1184,54 @@ def test_cli_bad_input_prints_usage_and_writes_nothing(env, monkeypatch, capsys,
     assert "usage:" in out or "cacheguard:" in out
 
 
-def test_cli_without_action_prints_help(env, capsys):
+def test_cli_without_action_prints_the_summary(env, capsys):
     assert env.plugin._cli_handler(_cli_args()) == 0
-    assert "HELP" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert out.startswith("cacheguard  ·  cli warn  ·  desktop warn  ·  gateway off")
+    assert "Cache lost, by pause length" in out and "(no observations yet)" in out
+    assert "```" not in out
+    # Names the terminal command, not the chat command.
+    assert "setup: hermes cacheguard setup all block 10 20" in out and "help: hermes cacheguard help" in out
+    assert "set: hermes cacheguard set pause_m 1" in out
+    assert "/cacheguard" not in out
+
+
+def test_cli_set_writes_one_setting(env, monkeypatch, capsys):
+    saved = _fake_settings_writer(monkeypatch)
+    env.plugin._CTX = None
+    assert env.plugin._cli_handler(_cli_args(cache_guard_action="set", words=["pause_m", "4"])) == 0
+    assert saved == [("cacheguard", ("pause_m",), 4)]
+    assert "pause_m = 4 min (saved to config)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("words", [[], ["cli"], ["minutes", "4"], ["pause_m", "0"], ["cli", "maybe"]])
+def test_cli_set_bad_input_prints_usage_and_writes_nothing(env, monkeypatch, capsys, words):
+    saved = _fake_settings_writer(monkeypatch)
+    env.plugin._CTX = None
+    assert env.plugin._cli_handler(_cli_args(cache_guard_action="set", words=words)) == 1
+    out = capsys.readouterr().out
+    assert "usage: hermes cacheguard set <name> <value>" in out and "/cacheguard" not in out
+    assert saved == []
+
+
+def test_cli_help_prints_the_chat_help_text(env, capsys):
+    assert env.plugin._cli_handler(_cli_args(cache_guard_action="help")) == 0
+    out = capsys.readouterr().out
+    assert out.startswith(env.plugin._HELP_TEXT)
+    assert "hermes cacheguard` takes: (nothing) | help | setup | set" in out
+
+
+def test_cli_parser_accepts_nothing_help_set_and_setup(env):
+    import argparse
+    parser = argparse.ArgumentParser()
+    env.plugin._cli_setup_parser(parser)
+    assert parser.parse_args([]).cache_guard_action is None
+    assert parser.parse_args(["help"]).cache_guard_action == "help"
+    assert parser.parse_args(["set", "pause_m", "4"]).words == ["pause_m", "4"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["off"])
+    args = parser.parse_args(["setup", "all", "block", "10", "20"])
+    assert (args.cache_guard_action, args.minutes, args.tokens) == ("setup", "10", "20")
 
 
 def test_register_adds_cli_command_and_slash_command(env):
@@ -1368,9 +1309,15 @@ def test_summary_shows_help_line(env):
     assert "help: /cacheguard help" in env.plugin._cmd_show()
 
 
-@pytest.mark.parametrize("args", ["help", "?", "HELP"])
-def test_help_text_for_help_and_question_mark(env, args):
+@pytest.mark.parametrize("args", ["help", "HELP"])
+def test_help_text_for_help(env, args):
     assert env.plugin._cmd_show(args) == env.plugin._HELP_TEXT
+
+
+@pytest.mark.parametrize("word", ["?", "clear"])
+def test_no_question_mark_or_clear_alias(env, word):
+    assert env.plugin._cmd_show(word) != env.plugin._HELP_TEXT
+    assert word not in env.plugin._HELP_TEXT.replace("/cacheguard <model>", "")
 
 
 def test_help_lists_every_command(env):
@@ -1378,8 +1325,21 @@ def test_help_lists_every_command(env):
     for line in ("/cacheguard all","/cacheguard <model>", "/cacheguard setup",
                  "/cacheguard set <name>", "/cacheguard export <first> <last>",
                  "/cacheguard export all", "/cacheguard debug", "/cacheguard reset",
-                 "/cacheguard help", "/cacheguard ?"):
+                 "/cacheguard help"):
         assert line in text
+
+
+def test_defaults_keys_are_frozen(env):
+    # A new setting needs the maintainer's explicit OK (AGENTS.md): change this list only when asked.
+    assert sorted(env.plugin.DEFAULTS) == sorted([
+        "cli", "desktop", "gateway", "display_on_success", "size_k", "pause_m"])
+
+
+def test_cacheguard_subcommands_are_frozen(env):
+    # A new command or alias needs the maintainer's explicit OK (AGENTS.md): change this list only when asked.
+    src = inspect.getsource(env.plugin._cmd_show)
+    assert set(re.findall(r'== "(\w+)"', src)) == {"help", "debug", "set", "setup", "export", "reset", "all"}
+    assert '"?"' not in src and '"clear"' not in src
 
 
 def test_help_covers_every_subcommand_handled_by_show(env):
@@ -1392,9 +1352,8 @@ def test_help_covers_every_subcommand_handled_by_show(env):
 
 
 def test_help_lists_every_set_name(env):
-    samples = {"cli": "block", "show_model": "on", "display_on_success": "on", "gateway": "block",
-               "model_change": "block", "minutes": "5", "tokens": "30",
-               "max_observations": "10000"}
+    samples = {"cli": "block", "desktop": "block", "display_on_success": "on", "gateway": "block",
+               "pause_m": "5", "size_k": "30"}
     for name, raw in samples.items():
         assert env.plugin._parse_setting(name, raw)[0] is not None
         assert f"  {name} " in env.plugin._HELP_TEXT
@@ -1410,6 +1369,7 @@ def test_help_has_examples(env):
     text = env.plugin._HELP_TEXT
     assert "Examples" in text
     assert "/cacheguard set gateway block" in text
+    assert "  /cacheguard set pause_m 1            change only the pause, here 1 minute" in text
     assert "bot" not in text.lower()
 
 
@@ -1417,10 +1377,10 @@ def test_help_says_pause_and_size_apply_to_all_once(env):
     assert env.plugin._HELP_TEXT.lower().count("apply to all") == 1
 
 
-@pytest.mark.parametrize("args", ["minutes -1", "minutes 0", "minutes 0.5"])
+@pytest.mark.parametrize("args", ["pause_m -1", "pause_m 0", "pause_m 0.5"])
 def test_minutes_below_one_gets_the_help_wording(env, args):
     out = env.plugin._cmd_show("set " + args)
-    assert out.startswith("cacheguard: minutes must be a number >= 1.")
+    assert out.startswith("cacheguard: pause_m must be a number >= 1.")
     assert "number >= 1" in env.plugin._HELP_TEXT
 
 
@@ -1449,11 +1409,11 @@ def test_register_args_hint_mentions_help(env):
 
 
 def test_setup_all_sets_all_three_groups(env):
-    env.settings = {"cli": "warn", "gateway": "warn"}  # desktop unset = cli = warn
+    env.settings = {"cli": "warn", "gateway": "warn"}
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup all block 10 30")
     assert ctx.calls == [("cli", "block"), ("desktop", "block"), ("gateway", "block"),
-                         ("min_gap_seconds", 600), ("min_context_tokens", 30000)]
+                         ("pause_m", 10), ("size_k", 30)]
     assert out == ("cacheguard: cli = block · desktop = block · gateway = block · pause ≥ 10 min · size ≥ 30k "
                    "(pause and size apply to all groups; saved to config).")
 
@@ -1462,7 +1422,7 @@ def test_setup_all_sets_gateway_even_when_it_was_off(env):
     ctx = _with_ctx(env)  # defaults: cli warn, gateway off
     out = env.plugin._cmd_show("setup all block 10 30")
     assert ctx.calls == [("cli", "block"), ("desktop", "block"), ("gateway", "block"),
-                         ("min_gap_seconds", 600), ("min_context_tokens", 30000)]
+                         ("pause_m", 10), ("size_k", 30)]
     assert out.startswith("cacheguard: cli = block · desktop = block · gateway = block")
     assert "left off" not in out and "every group is off" not in out
 
@@ -1470,7 +1430,7 @@ def test_setup_all_sets_gateway_even_when_it_was_off(env):
 def test_setup_gateway_target_turns_off_gateway_on(env):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup gateway block 10 30")
-    assert ctx.calls == [("gateway", "block"), ("min_gap_seconds", 600), ("min_context_tokens", 30000)]
+    assert ctx.calls == [("gateway", "block"), ("pause_m", 10), ("size_k", 30)]
     assert env.plugin._cfg()["gateway"] == "block"
     assert "left off" not in out and out.startswith("cacheguard: gateway = block")
 
@@ -1479,7 +1439,7 @@ def test_setup_desktop_target_sets_only_desktop(env):
     env.settings = {"cli": "off"}
     ctx = _with_ctx(env)
     env.plugin._cmd_show("setup desktop block 10 30")
-    assert ctx.calls == [("desktop", "block"), ("min_gap_seconds", 600), ("min_context_tokens", 30000)]
+    assert ctx.calls == [("desktop", "block"), ("pause_m", 10), ("size_k", 30)]
     cfg = env.plugin._cfg()
     assert cfg["desktop"] == "block" and cfg["cli"] == "off"
 
@@ -1495,7 +1455,7 @@ def test_setup_old_form_without_target_is_rejected_and_writes_nothing(env):
 def test_setup_with_group_sets_only_that_group(env, group):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show(f"setup {group} warn 5 20")
-    assert ctx.calls == [(group, "warn"), ("min_gap_seconds", 300), ("min_context_tokens", 20000)]
+    assert ctx.calls == [(group, "warn"), ("pause_m", 5), ("size_k", 20)]
     assert out == (f"cacheguard: {group} = warn · pause ≥ 5 min · size ≥ 20k "
                    "(pause and size apply to all groups; saved to config).")
 
@@ -1503,7 +1463,7 @@ def test_setup_with_group_sets_only_that_group(env, group):
 def test_setup_thresholds_are_global_even_with_a_group(env):
     ctx = _with_ctx(env)
     env.plugin._cmd_show("setup gateway off 10 30")
-    assert ("min_gap_seconds", 600) in ctx.calls and ("min_context_tokens", 30000) in ctx.calls
+    assert ("pause_m", 10) in ctx.calls and ("size_k", 30) in ctx.calls
     assert not any(k.endswith(("_gap_seconds", "_context_tokens")) and k not in ("min_gap_seconds", "min_context_tokens")
                    for k, _ in ctx.calls)
 
@@ -1527,7 +1487,7 @@ def test_setup_accepts_off_mode(env):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup all off 10 30")
     assert "saved" in out and ctx.calls == [
-        ("cli", "off"), ("desktop", "off"), ("gateway", "off"), ("min_gap_seconds", 600), ("min_context_tokens", 30000),
+        ("cli", "off"), ("desktop", "off"), ("gateway", "off"), ("pause_m", 10), ("size_k", 30),
     ]
     assert out.count("saved") == 1
 
@@ -1552,11 +1512,11 @@ def test_setup_all_off_writes_only_modes(env):
 
 
 def test_setup_mode_only_keeps_pause_and_size(env):
-    env.settings = {"min_gap_seconds": 600, "min_context_tokens": 30000}
+    env.settings = {"pause_m": 10, "size_k": 30}
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup cli block")
     assert ctx.calls == [("cli", "block")]
-    assert env.plugin._cfg()["min_gap_seconds"] == 600 and env.plugin._cfg()["min_context_tokens"] == 30000
+    assert env.plugin._cfg()["pause_m"] == 10 and env.plugin._cfg()["size_k"] == 30
     assert "pause" not in out and "context" not in out and out.endswith("(saved to config).")
 
 
@@ -1571,25 +1531,35 @@ def test_setup_one_of_minutes_or_size_is_usage_and_writes_nothing(env, args):
     assert ctx.calls == []
 
 
-def test_off_alias_is_setup_all_off(env):
+def test_setup_all_off_turns_the_three_groups_off(env):
     env.settings = {"cli": "block", "gateway": "warn"}
     ctx = _with_ctx(env)
-    via_alias = env.plugin._cmd_show("off")
-    alias_calls = list(ctx.calls)
-    env.settings = {"cli": "block", "gateway": "warn"}
-    ctx = _with_ctx(env)
-    via_setup = env.plugin._cmd_show("setup all off")
-    assert via_alias.startswith(via_setup) and alias_calls == ctx.calls
-    assert "/cacheguard setup all warn" in via_alias and "/cacheguard set gateway off" in via_alias
-    assert "does not restore" in via_alias
-    assert alias_calls == [("cli", "off"), ("desktop", "off"), ("gateway", "off")]
+    assert "saved" in env.plugin._cmd_show("setup all off")
+    assert ctx.calls == [("cli", "off"), ("desktop", "off"), ("gateway", "off")]
 
 
-@pytest.mark.parametrize("args", ["off now", "reset now"])
-def test_on_off_reset_with_extra_arguments_are_refused(env, monkeypatch, args):
+def test_reset_with_extra_arguments_is_refused(env, monkeypatch):
     saved = _fake_settings_writer(monkeypatch)
-    assert env.plugin._cmd_show(args) == f"usage: /cacheguard {args.split()[0]}"
+    assert env.plugin._cmd_show("reset now") == "usage: /cacheguard reset"
     assert saved == []
+
+
+@pytest.mark.parametrize("word", ["off", "on"])
+def test_off_and_on_are_not_commands(env, monkeypatch, word):
+    saved = _fake_settings_writer(monkeypatch)
+    assert env.plugin._cmd_show(word) == f"No recorded model matches {word}. Use /cacheguard all to list recorded models."
+    assert saved == []
+    assert f"/cacheguard {word}\n" not in env.plugin._HELP_TEXT
+
+
+def test_enabled_is_not_a_setting(env):
+    assert "enabled" not in env.plugin.DEFAULTS
+    assert env.plugin._parse_setting("enabled", "off")[0] is None
+    env.config["enabled"] = False  # an old key in config.yaml is ignored
+    assert "enabled" not in env.plugin._cfg() and env.plugin._health_text() == ""
+    seed_session(env, ago=3600)
+    out, called, _ = run_middleware(env)
+    assert called and env.warned() is not None  # cacheguard still acts
 
 
 def test_unknown_arguments_are_named(env):
@@ -1615,10 +1585,6 @@ def test_bad_input_on_every_subcommand_gets_usage(env):
     assert env.plugin._cmd_show("export x y").startswith("usage: /cacheguard export")
 
 
-def test_setup_help_says_cache_lifetime_is_shorter_than_default_pause(env):
-    assert "Claude keeps the cache about 5 min, but the default pause is 10: try minutes 4" in env.plugin._HELP_TEXT
-
-
 def test_visible_name_is_cacheguard(env):
     assert env.plugin._HELP_TEXT.startswith("cacheguard help")
     assert "label" not in env.plugin.DEFAULTS
@@ -1639,7 +1605,7 @@ def _fake_approval_modules(monkeypatch, notify=True, wait=True):
 
     approval = types.ModuleType("tools.approval")
     if notify:
-        approval._gateway_notify_cb = lambda key: None
+        approval._gateway_notify_cb = lambda session_key: None
     gate = types.ModuleType("tools.approval_gateway_wait")
     if wait:
         gate._await_gateway_decision = lambda *a, **k: {}
@@ -1660,7 +1626,107 @@ def test_health_flags_missing_gateway_symbol(env, monkeypatch, kw):
     text = env.plugin._health_text()
     assert "gateway_approval" in text and "cacheguard cannot show the box here: it only warns." in text
     assert "cacheguard cannot show the box here: it only warns." in env.plugin._H["noticed"]
-    assert not any("gateway_approval" in line or "_await_gateway" in line for line in env.printed)
+    assert not any("gateway_approval" in line or "_await_gateway" in line for line in env.notices)
+
+
+# The way Hermes 0.22.2 defines the function the box leans on most.
+_WAIT_SIGNATURE = "session_key, notify_cb, approval_data, *, surface='gateway'"
+_WAIT_CHANGES = {  # a changed Hermes, and the plain reason we expect to name
+    "extra argument": ("def _await_gateway_decision(session_key, notify_cb, approval_data, extra):\n    return {}\n",
+                       "it now needs `extra`"),
+    "extra argument first": ("def _await_gateway_decision(extra, session_key, notify_cb, approval_data):\n    return {}\n",
+                             "its arguments are now (extra, session_key, notify_cb), not (session_key, notify_cb, approval_data)"),
+    "renamed argument": ("def _await_gateway_decision(session_key, notify, approval_data):\n    return {}\n",
+                         "its arguments are now (session_key, notify, approval_data), not (session_key, notify_cb, approval_data)"),
+    "removed argument": ("def _await_gateway_decision(session_key, notify_cb):\n    return {}\n",
+                         "it no longer takes `approval_data`"),
+    "sync to async": ("async def _await_gateway_decision(session_key, notify_cb, approval_data):\n    return {}\n",
+                      "it is now async"),
+    "function to class": ("class _await_gateway_decision:\n    pass\n", "it is no longer a function"),
+    "function to variable": ("_await_gateway_decision = None\n", "it is no longer a function"),
+}
+_WAIT_FINE = {  # harmless changes: no error
+    "same as Hermes": f"def _await_gateway_decision({_WAIT_SIGNATURE}):\n    return {{}}\n",
+    "new optional argument at the end": "def _await_gateway_decision(session_key, notify_cb, approval_data, *, surface='gateway', more=None):\n    return {}\n",
+    "new optional positional at the end": "def _await_gateway_decision(session_key, notify_cb, approval_data, more=1):\n    return {}\n",
+    "extra arguments swallowed": "def _await_gateway_decision(*args, **kwargs):\n    return {}\n",
+}
+
+
+def _loaded_wait_module(monkeypatch, source):
+    import sys
+
+    approval = types.ModuleType("tools.approval")
+    approval._gateway_notify_cb = lambda session_key: None
+    gate = types.ModuleType("tools.approval_gateway_wait")
+    exec(source, gate.__dict__)
+    monkeypatch.setitem(sys.modules, "tools.approval", approval)
+    monkeypatch.setitem(sys.modules, "tools.approval_gateway_wait", gate)
+
+
+@pytest.mark.parametrize("change", _WAIT_CHANGES)
+def test_health_names_a_changed_call_shape_in_a_loaded_module(env, monkeypatch, change):
+    source, reason = _WAIT_CHANGES[change]
+    _loaded_wait_module(monkeypatch, source)
+    ok, detail = env.plugin._health()["gateway_approval"]
+    assert not ok and detail == f"Hermes changed `_await_gateway_decision`: {reason}"
+    env.plugin._run_health()
+    text = env.plugin._health_text()
+    assert "gateway_approval: Hermes changed `_await_gateway_decision`" in text
+    assert "cacheguard cannot show the box here: it only warns." in text
+    assert not any("_await_gateway" in line for line in env.notices)  # the name stays in /cacheguard
+
+
+@pytest.mark.parametrize("change", _WAIT_FINE)
+def test_health_accepts_harmless_call_shape_changes(env, monkeypatch, change):
+    _loaded_wait_module(monkeypatch, _WAIT_FINE[change])
+    assert env.plugin._health()["gateway_approval"] == (True, "")
+
+
+@pytest.mark.parametrize("change", _WAIT_CHANGES)
+def test_health_names_a_changed_call_shape_read_from_source(env, tmp_path, monkeypatch, change):
+    source, reason = _WAIT_CHANGES[change]
+    module = _fake_hermes_module(tmp_path, monkeypatch, source)
+    monkeypatch.setitem(env.plugin._CALLS, (module, "_await_gateway_decision"),
+                        env.plugin._CALLS[("tools.approval_gateway_wait", "_await_gateway_decision")])
+    assert env.plugin._call_problem(module, "_await_gateway_decision") == (
+        f"Hermes changed `_await_gateway_decision`: {reason}")
+    assert "cgfake_marker" not in sys.modules  # read, never imported
+
+
+@pytest.mark.parametrize("change", _WAIT_FINE)
+def test_harmless_call_shape_changes_read_from_source(env, tmp_path, monkeypatch, change):
+    module = _fake_hermes_module(tmp_path, monkeypatch, _WAIT_FINE[change])
+    monkeypatch.setitem(env.plugin._CALLS, (module, "_await_gateway_decision"),
+                        env.plugin._CALLS[("tools.approval_gateway_wait", "_await_gateway_decision")])
+    assert env.plugin._call_problem(module, "_await_gateway_decision") == ""
+
+
+def test_keyword_argument_we_pass_must_still_exist(env, tmp_path, monkeypatch):
+    module = _fake_hermes_module(tmp_path, monkeypatch, "def normalize_usage(response_usage, *, provider=None):\n    pass\n")
+    monkeypatch.setitem(env.plugin._CALLS, (module, "normalize_usage"),
+                        env.plugin._CALLS[("agent.usage_pricing", "normalize_usage")])
+    assert env.plugin._call_problem(module, "normalize_usage") == (
+        "Hermes changed `normalize_usage`: it no longer takes `api_mode`")
+
+
+def test_unreadable_hermes_source_is_reported_not_raised(env, tmp_path, monkeypatch):
+    module = _fake_hermes_module(tmp_path, monkeypatch, "def _await_gateway_decision(:\n")
+    monkeypatch.setitem(env.plugin._CALLS, (module, "_await_gateway_decision"),
+                        env.plugin._CALLS[("tools.approval_gateway_wait", "_await_gateway_decision")])
+    assert env.plugin._call_problem(module, "_await_gateway_decision") == (
+        "cannot read `_await_gateway_decision`: SyntaxError")
+
+
+def test_every_checked_call_has_a_signature_to_compare(env):
+    # Each function the health check reads must have an expected shape, or a change would pass.
+    shaped = {symbol for _module, symbol in env.plugin._CALLS}
+    for symbol in ("_get_approval_callback", "_gateway_notify_cb", "_await_gateway_decision",
+                   "CLIModalMixin._normalize_slash_confirm_choice", "normalize_usage",
+                   "get_current_session_key", "get_current_write_origin", "read_raw_config",
+                   "get_hermes_home", "get_session_env", "is_bot_mode_managed",
+                   "_is_single_query_approval_context", "_get_approval_timeout"):
+        assert symbol in shaped
 
 
 def test_health_skips_cli_object_symbols(env):
@@ -1672,7 +1738,7 @@ def test_cfg_reads_the_read_only_config_when_available(env, monkeypatch):
 
     calls = []
     mod = sys.modules["hermes_cli.config"]
-    monkeypatch.setattr(mod, "read_raw_config_readonly", lambda: (calls.append(1), {"cacheguard": {"cli": "block"}})[1],
+    monkeypatch.setattr(mod, "read_raw_config_readonly", lambda: (calls.append(1), {"plugins": {"entries": {"cacheguard": {"settings": {"cli": "block"}}}}})[1],
                         raising=False)
     monkeypatch.setattr(mod, "read_raw_config", lambda: pytest.fail("deep-copying read used"))
     assert env.plugin._cfg()["cli"] == "block" and calls
@@ -1812,7 +1878,8 @@ def test_export_unknown_live_session_does_not_fall_back_to_cached(env):
 def test_export_after_blocked_send_uses_active_cli_session(env):
     _seed_chat(env, 2, "A")
     _seed_chat(env, 2, "B")
-    env.config.update(cli="block", min_context_tokens=1000)
+    seed_session(env, session_id="B", ago=3600)
+    env.config.update(cli="block", size_k=1)
     env.approval = lambda *a, **k: "deny"
     denied, called, _ = run_middleware(env, session_id="B")
     assert not called and "message not sent" in denied.choices[0].message.content
@@ -1856,9 +1923,9 @@ def _reply(env, text="Hello", session_id="s1"):
 
 def test_outcome_kept_is_appended_once(env, monkeypatch):
     _guard_acts(env, monkeypatch)
-    assert env.printed == []
-    assert _reply(env) == "Hello\n\n[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
-    assert _reply(env) is None
+    assert not env.notices
+    assert _reply(env) is None and env.posted == [RESULT_LINE]
+    assert _reply(env) is None and env.posted == [RESULT_LINE]
 
 
 def test_outcome_kept_is_hidden_by_default(env, monkeypatch):
@@ -1895,34 +1962,52 @@ def test_kept_line_hidden_when_option_unset(env, monkeypatch, mode):
 def test_kept_line_shown_when_option_on_warn(env, monkeypatch):
     env.config["display_on_success"] = True
     _turn(env, monkeypatch, mode="warn")
-    assert _reply(env) == "Hello\n\n[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
+    assert _reply(env) is None and env.posted == [RESULT_LINE]
 
 
 def test_kept_line_shown_when_option_on_block(env, monkeypatch):
     env.config["display_on_success"] = True
     calls, boxes = _turn(env, monkeypatch, mode="block")
     assert calls == [1] and len(boxes) == 1
-    assert _reply(env) == "Hello\n\n[CACHEGUARD] 59,000 tokens reused after a 60-minute pause"
+    assert _reply(env) is None and env.posted == ["CGUARD 59k reused, 60 min"]
 
 
-@pytest.mark.parametrize("mode,tag", [("warn", "WARN · "), ("block", "")])
+@pytest.mark.parametrize("mode,tag", [("warn", "WARN "), ("block", "")])
 def test_loss_line_shown_when_option_off(env, monkeypatch, mode, tag):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode=mode, cached=1000)
-    assert _reply(env) == f"Hello\n\n[CACHEGUARD] {tag}cache lost · 59,000 tokens reloaded"
+    assert _reply(env) is None
+    assert env.posted == [f"CGUARD {tag}cache lost, 59k rebilled, 60 min"]
 
 
 def test_unknown_line_shown_when_option_off(env, monkeypatch):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode="warn", cached=0)
-    out = _reply(env)
-    assert "Cache status unknown after a 60-minute pause · not enough earlier cache hits to judge" in out
+    assert _reply(env) is None
+    assert env.posted == ["CGUARD WARN cache unknown, too few cache hits, 60 min"]
 
 
-def test_model_changed_line_shown_when_option_off(env, monkeypatch):
+def test_model_changed_line_hidden_when_cache_kept_and_option_off(env, monkeypatch):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode="warn", model="m2")
-    assert "model changed" in _reply(env)
+    assert env.plugin._PENDING == {} and _reply(env) is None
+
+
+def test_model_changed_line_shown_when_cache_kept_and_option_on(env, monkeypatch):
+    env.config["display_on_success"] = True
+    _turn(env, monkeypatch, mode="warn", model="m2")
+    assert _reply(env) is None and env.posted == ["CGUARD OK 59k reused, model changed"]
+
+
+def test_model_changed_line_shown_when_cache_lost_whatever_the_option(env, monkeypatch):
+    env.config["display_on_success"] = False
+    _turn(env, monkeypatch, mode="warn", model="m2", cached=0)
+    assert _reply(env) is None
+    assert env.posted == ["CGUARD WARN cache lost, 60k rebilled, model changed"]
+
+
+def test_cache_lost_is_one_rule_for_every_turn(env):
+    assert env.plugin._cache_lost(30, 100) and not env.plugin._cache_lost(29, 100)
 
 
 @pytest.mark.parametrize("bad", ["yes", 1])
@@ -1968,7 +2053,7 @@ def test_outcome_stays_for_its_own_turn(env, monkeypatch):
     other = env.plugin._transform_llm_output(
         response_text="side answer", session_id="s1", model="p/m1", platform="cli", turn_id="t2")
     assert other is None and "s1" in env.plugin._PENDING
-    assert _reply(env).endswith("59,000 tokens reused after a 60-minute pause")
+    assert _reply(env) is None and env.posted == [RESULT_LINE]
 
 
 def test_stale_outcome_from_no_text_turn_is_dropped(env, monkeypatch):
@@ -1984,13 +2069,15 @@ def test_stale_outcome_from_no_text_turn_is_dropped(env, monkeypatch):
 def test_stale_gateway_warning_is_dropped_at_turn_start(env, monkeypatch):
     env.plugin._WARNED["s1"] = "old warning"  # left by a turn whose provider call failed
     _guard_acts(env, monkeypatch)
-    assert "old warning" not in _reply(env)
+    _reply(env)
+    assert all("old warning" not in line for line in env.posted)
     assert "s1" not in env.plugin._WARNED
 
 
 def test_outcome_loss_reports_rebilled_tokens_and_pause(env, monkeypatch):
     _guard_acts(env, monkeypatch, cached=1000)
-    assert _reply(env).endswith("\n\n[CACHEGUARD] WARN · cache lost · 59,000 tokens reloaded")
+    _reply(env)
+    assert env.posted == ["CGUARD WARN cache lost, 59k rebilled, 60 min"]
 
 
 def _zero_reads(env, count):
@@ -2007,7 +2094,8 @@ def test_model_without_cache_says_so_once_then_stays_silent(env, monkeypatch):
     env.plugin._NO_CACHE_SAID.clear()
     _zero_reads(env, 3)
     _guard_acts(env, monkeypatch, cached=0, first_cached=0)
-    assert _reply(env) == "Hello\n\n[CACHEGUARD] WARN · Cache status unknown · this model does not report a cache"
+    _reply(env)
+    assert env.posted == ["CGUARD WARN cache unknown, model reports no cache"]
     assert env.plugin._NO_CACHE_SAID == {"p/m1"}
     row = {"evaluable": False, "cause": None, "cache_read_tokens": 0, "prompt_tokens": 60000,
            "model": "p/m1", "api_mode": "chat_completions", "gap_s": 3600}
@@ -2015,46 +2103,48 @@ def test_model_without_cache_says_so_once_then_stays_silent(env, monkeypatch):
     assert env.plugin._PENDING.get("s2") is None  # said once for this model: nothing more
     env.plugin._NO_CACHE_SAID.clear()
     env.plugin._queue_outcome({"session_id": "s2"}, True, row)
-    assert "does not report a cache" in env.plugin._PENDING["s2"]
+    assert "model reports no cache" in env.plugin._PENDING["s2"]
 
 
 def test_zero_reads_with_too_little_history_do_not_claim_no_cache(env, monkeypatch):
     env.plugin._NO_CACHE_SAID.clear()
     _guard_acts(env, monkeypatch, cached=0, first_cached=0)  # only 1 earlier zero read plus this one
-    assert "does not report a cache" not in _reply(env)
+    _reply(env)
+    assert all("no cache" not in line for line in env.posted)
 
 
 def test_model_that_once_read_the_cache_is_not_called_cacheless(env, monkeypatch):
     env.plugin._NO_CACHE_SAID.clear()
     _zero_reads(env, 3)
     _guard_acts(env, monkeypatch, cached=0)  # the first call of this chat read 59,000
-    assert "does not report a cache" not in _reply(env)
+    _reply(env)
+    assert all("no cache" not in line for line in env.posted)
 
 
 def test_zero_read_with_one_positive_reports_no_baseline_yet(env, monkeypatch):
     _guard_acts(env, monkeypatch, cached=0)
-    out = _reply(env)
-    assert "Cache status unknown after a 60-minute pause · not enough earlier cache hits to judge" in out
-    assert "Cache loss:" not in out
+    _reply(env)
+    assert env.posted == ["CGUARD WARN cache unknown, too few cache hits, 60 min"]
 
 
 def test_outcome_without_finite_pause_omits_clause(env):
     row = {"evaluable": True, "cold": True, "miss_delta": 5, "gap_s": None}
-    assert env.plugin._outcome_text(row) == "cache lost · 5 tokens reloaded"
+    assert env.plugin._outcome_text(row) == "cache lost, 5 rebilled"
 
 
 def test_gateway_outcome_uses_the_same_label_as_the_cli(env, monkeypatch):
     env.config.update(gateway="warn")
     _guard_acts(env, monkeypatch, platform="telegram")
-    out = _reply(env)
-    assert out == "Hello\n\n[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
+    assert _reply(env) is None
+    assert env.posted == [RESULT_LINE]
 
 
 def test_label_key_in_config_is_ignored(env, monkeypatch):
     env.config.update(label="🚧cacheguard🚧", gateway="warn")
     assert "label" not in env.plugin._cfg() and not env.plugin._H["config_errors"]
     _guard_acts(env, monkeypatch)
-    assert "\n\n[CACHEGUARD] OK · " in _reply(env)
+    _reply(env)
+    assert env.posted == [RESULT_LINE]
     assert env.plugin._deny_text("s1", gap_s=60).startswith("[CACHEGUARD] BLOCKED · message not sent")
 
 
@@ -2065,8 +2155,10 @@ def test_set_label_is_gone(env):
 
 def test_outcome_is_per_session(env, monkeypatch):
     _guard_acts(env, monkeypatch)
-    assert _reply(env, session_id="other") is None
-    assert _reply(env) is not None
+    _reply(env, session_id="other")
+    assert env.posted == []
+    _reply(env)
+    assert env.posted == [RESULT_LINE]
 
 
 def test_transform_never_breaks_reply(env, monkeypatch):
@@ -2083,27 +2175,13 @@ def test_no_outcome_when_guard_did_not_act(env):
 
 
 def test_no_outcome_when_user_denied(env):
-    env.config = {"cli": "block", "min_gap_seconds": 0, "min_context_tokens": 1000}
+    env.config = {"cli": "block", "min_gap_seconds": 0, "size_k": 1}
     env.approval = lambda *a, **k: "deny"
     seed_session(env, ago=3600, prompt_tokens=60000)
     result, called, _ = run_middleware(env, request=big_request())
     assert not called and "message not sent" in result.choices[0].message.content
     assert env.warned() is None and env.plugin._load_observations() == []
     assert _reply(env) is None
-
-
-def test_export_skips_cacheguard_denials(env):
-    _seed_chat(env, 4)
-    con = env.db()
-    con.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("s1", "assistant", "cacheguard: message NOT sent — cold", 50.0))
-    con.commit()
-    con.close()
-    run_middleware(env)
-    _set_export_cli(env, "s1")
-    out = env.plugin._cmd_show("export all")
-    assert "4 of 4 messages" in out
-    assert "message not sent" not in open(out.splitlines()[1], encoding="utf-8").read()
 
 
 def test_gateway_deny_text_omits_cli_only_export(env):
@@ -2131,19 +2209,11 @@ def test_storage_lock_uses_msvcrt_without_fcntl(env, monkeypatch):
 
 def test_deny_texts_point_to_new_session(env):
     assert "export" not in env.plugin._deny_text(session_id="s1")
-    env.settings["model_change"] = "block"
+    env.settings["cli"] = "block"
     env.approval = lambda *a, **k: "deny"
     seed_session(env, model="p/other", ago=5)
     out, called, _ = run_middleware(env, model="m1")
     assert not called and "start /new and paste it. Session ID: s1" in out.choices[0].message.content
-
-
-def test_model_change_follows_mode_when_unset(env):
-    env.config.pop("model_change", None)
-    env.config["cli"] = "block"
-    assert env.plugin._model_change_mode(env.config) == "block"
-    env.config["model_change"] = "off"
-    assert env.plugin._model_change_mode(env.config) == "off"
 
 
 def test_desktop_platforms_use_desktop_mode_when_set(env):
@@ -2155,68 +2225,32 @@ def test_desktop_platforms_use_desktop_mode_when_set(env):
     assert env.plugin._surface_mode({"platform": "telegram"}, cfg) == "off"
 
 
-@pytest.mark.parametrize("platform", ["desktop", "webui"])
-def test_desktop_falls_back_to_cli_when_unset(env, platform):
-    cfg = {"cli": "block", "desktop": None, "gateway": "off"}
-    assert env.plugin._surface_mode({"platform": platform}, cfg) == "block"
-    assert env.plugin._is_cli_platform({"platform": platform})
+def test_desktop_defaults_to_warn_whatever_cli_says(env):
+    env.config = {"cli": "block"}
+    cfg = env.plugin._cfg()
+    assert cfg["desktop"] == "warn"
+    for platform in ("desktop", "webui"):
+        assert env.plugin._surface_mode({"platform": platform}, cfg) == "warn"
+        assert env.plugin._is_cli_platform({"platform": platform})
 
 
 def test_invalid_desktop_value_is_rejected(env):
     env.config = {"cli": "block", "desktop": "maybe"}
     cfg = env.plugin._cfg()
-    assert cfg["desktop"] is None and cfg["cli"] == "block"
+    assert cfg["desktop"] == "warn" and cfg["cli"] == "block"
     assert "health: degraded" in env.plugin._health_text()
     env.config = {"desktop": "off"}
     assert env.plugin._cfg()["desktop"] == "off"
 
 
-def test_model_change_follows_desktop_mode_when_unset(env):
-    cfg = {"cli": "block", "desktop": "warn", "gateway": "off", "model_change": None}
-    mode = env.plugin._surface_mode({"platform": "desktop"}, cfg)
-    assert env.plugin._model_change_mode(cfg, mode) == "warn"
-    assert env.plugin._model_change_mode(cfg) == "block"
-
-
 def test_debug_timeline_flags_model_change_and_cold(env):
     rows = [
-        {"ts": 1000, "session_id": "s1", "model": "a/x", "gap_s": None, "prompt_tokens": 50000, "cache_read_tokens": 0, "cold": True},
-        {"ts": 1100, "session_id": "s1", "model": "b/y", "gap_s": 100.0, "prompt_tokens": 50000, "cache_read_tokens": 0, "cold": True},
+        _journal_row("s1", ts=1000.0, model="a/x", gap_s=None, cause="start", prompt=50000, cache_read_tokens=0),
+        _journal_row("s1", ts=1100.0, model="b/y", gap_s=100.0, cause="model_switch", prompt=50000, cache_read_tokens=0),
     ]
     env.plugin._load_observations = lambda: rows
     out = env.plugin._cmd_debug([])
-    assert "session s1" in out and "MODEL CHANGE from a/x" in out and out.count("LEGACY COLD") == 2 and "APPROXIMATE" in out
-
-
-def test_print_goes_through_cli_status_printer(env, monkeypatch):
-    """Inside the CLI the line goes to _agent_status_print (held until the reply box closes)."""
-    from types import SimpleNamespace
-    held = []
-    cli = SimpleNamespace(_agent_status_print=held.append)
-    monkeypatch.setattr(env.plugin, "_CTX", SimpleNamespace(_manager=SimpleNamespace(_cli_ref=cli)))
-    env.plugin._print_line("hello")
-    assert held == ["hello"] and env.warned() is None
-
-
-def test_print_falls_back_when_visible_print_renamed(env, monkeypatch, capsys):
-    """Old/renamed cli._cli_visible_print (the degraded case) -> the line still reaches plain print."""
-    import sys
-    import types
-
-    monkeypatch.setattr(env.plugin, "_CTX", None)  # no CLI status printer either
-    monkeypatch.setitem(sys.modules, "cli", types.ModuleType("cli"))  # symbol gone
-    env.plugin._print_line("hello")
-    assert "hello" in capsys.readouterr().out
-
-
-def test_print_falls_back_when_cli_import_fails(env, monkeypatch, capsys):
-    """No cli module at all (gateway, -q, tests) -> plain print, never an exception."""
-    import sys
-
-    monkeypatch.setattr(env.plugin, "_CTX", None)
-    monkeypatch.setitem(sys.modules, "cli", None)  # `from cli import ...` raises ImportError
-    env.plugin._print_line("hello")
-    assert "hello" in capsys.readouterr().out
+    assert "session s1" in out and "MODEL CHANGE from a/x" in out and "NON-EVALUABLE" in out
 
 
 def _seed_rows(env, models, per=1):
@@ -2257,7 +2291,7 @@ def test_show_observed_counts_for_its_own_range(env):
     call(20, 400.0, 0)
     out = env.plugin._cmd_show("")
     rows = [line for line in out.splitlines() if line.startswith("p/m")]
-    assert len(rows) == 1 and "0% (20)" in rows[0]
+    assert len(rows) == 1 and "0/20" in rows[0]
     assert "1/1" in rows[0] and "tokens unknown" not in rows[0]
     assert "predicted" not in out
 
@@ -2298,28 +2332,18 @@ def test_trim_survives_write_error(env, monkeypatch):
     assert not list(path.parent.glob("*.tmp"))
 
 
-def test_max_observations_setting(env):
-    ctx = _with_ctx(env)
-    assert env.plugin._cfg()["max_observations"] == 10000
-    assert "saved" in env.plugin._cmd_show("set max_observations 5000")
-    assert ctx.calls == [("max_observations", 5000)]
-    assert "usage:" in env.plugin._cmd_show("set max_observations 999")
-    env.settings["max_observations"] = 10
-    assert env.plugin._cfg()["max_observations"] == 10000
-
-
 # ------------------------------------------------- deny text / legacy key ---
 def test_deny_text_cancelled_and_timeout_forms(env):
     first = lambda **kw: env.plugin._deny_text("s1", **kw).splitlines()[0]
-    assert first(gap_s=1800) == "[CACHEGUARD] BLOCKED · message not sent after a 30-minute pause (cancelled)"
+    assert first(gap_s=1800) == "[CACHEGUARD] BLOCKED · message not sent after a pause of 30 minutes (cancelled)"
     assert first(gap_s=1800, outcome="timeout", timeout=300) == (
-        "[CACHEGUARD] BLOCKED · message not sent after a 30-minute pause and 300s timeout")
+        "[CACHEGUARD] BLOCKED · message not sent after a pause of 30 minutes and 300s timeout")
     assert first(cause="model changed") == "[CACHEGUARD] BLOCKED · message not sent (model changed)"
 
 def test_deny_text_when_prompt_could_not_be_delivered(env, monkeypatch):
     first = lambda **kw: env.plugin._deny_text("s1", **kw).splitlines()[0]
     assert first(gap_s=1800, outcome="undelivered", timeout=300) == (
-        "[CACHEGUARD] BLOCKED · message not sent after a 30-minute pause and the prompt could not be delivered")
+        "[CACHEGUARD] BLOCKED · message not sent after a pause of 30 minutes and the prompt could not be delivered")
     assert first(outcome="undelivered", timeout=300) == (
         "[CACHEGUARD] BLOCKED · message not sent · the prompt could not be delivered")
     wait = types.ModuleType("tools.approval_gateway_wait")
@@ -2332,7 +2356,6 @@ def test_deny_text_when_prompt_could_not_be_delivered(env, monkeypatch):
     assert "could not be delivered" in text and "timeout" not in text
 
 
-
 @pytest.mark.parametrize("answer,tail", [("deny", "(cancelled)"), ("timeout", "and 300s timeout")])
 def test_block_reports_cancel_or_timeout(env, answer, tail):
     env.config["cli"] = "block"
@@ -2340,7 +2363,7 @@ def test_block_reports_cancel_or_timeout(env, answer, tail):
     env.approval = lambda *a, **k: answer
     out, called, _ = run_middleware(env)
     first = out.choices[0].message.content.splitlines()[0]
-    assert not called and first.startswith("[CACHEGUARD] BLOCKED · message not sent after a 60-minute pause") and first.endswith(tail)
+    assert not called and first.startswith("[CACHEGUARD] BLOCKED · message not sent after a pause of 60 minutes") and first.endswith(tail)
 
 
 def test_mode_is_not_a_setting(env):
@@ -2350,32 +2373,26 @@ def test_mode_is_not_a_setting(env):
     assert env.plugin._parse_setting("mode", "warn")[0] is None
 
 
-def test_mode_values_ignore_case_and_spaces(env):
+def test_mode_values_are_not_reshaped(env):
     env.config.update(cli=" Block ", gateway="WARN")
     cfg = env.plugin._cfg()
-    assert (cfg["cli"], cfg["gateway"]) == ("block", "warn")
-    assert "health: degraded" not in env.plugin._health_text()
+    assert (cfg["cli"], cfg["gateway"]) == ("warn", "off")  # defaults: neither value is a mode
+    assert "health: degraded" in env.plugin._health_text()
 
 
-@pytest.mark.parametrize("value, expected", [
-    ("false", False), ("No", False), (" off ", False), ("0", False), (0, False),
-    ("true", True), ("on", True), (1, True), (False, False)])
-def test_enabled_accepts_words_and_numbers(env, value, expected):
-    env.config.update(enabled=value)
-    assert env.plugin._cfg()["enabled"] is expected
-
-
-def test_parse_setting_cli_and_show_model(env):
+def test_parse_setting_group_modes(env):
     assert env.plugin._parse_setting("cli", "warn")[0] == ("cli", "warn", "warn")
-    assert env.plugin._parse_setting("show_model", "on")[0] == ("show_model", True, "on")
-    assert env.plugin._parse_setting("show_model", "maybe")[0] is None
+    assert env.plugin._parse_setting("desktop", "block")[0] == ("desktop", "block", "block")
+    assert env.plugin._parse_setting("desktop", "maybe")[0] is None
+    for gone in ("show_model", "model_change", "max_observations"):
+        assert env.plugin._parse_setting(gone, "on")[0] is None
 
 
 def test_export_skips_new_style_denials(env):
     _seed_chat(env, 4)
     con = env.db()
     con.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
-                ("s1", "assistant", "[CACHEGUARD] BLOCKED · message not sent after a 5-minute pause (cancelled)", 50.0))
+                ("s1", "assistant", "[CACHEGUARD] BLOCKED · message not sent after a pause of 5 minutes (cancelled)", 50.0))
     con.commit()
     con.close()
     _set_export_cli(env, "s1")
@@ -2384,17 +2401,12 @@ def test_export_skips_new_style_denials(env):
 
 
 # ------------------------------------------------- final message format
-def test_using_line_is_provider_then_last_model_segment(env):
-    using = env.plugin._using_line
-    assert using("openrouter/deepseek/deepseek-v4.1-flash") == "using openrouter deepseek-v4.1-flash"
-    assert using("openai-codex/gpt-6-luna") == "using openai-codex gpt-6-luna"
-
-
 def test_kept_result_line_leaves_out_the_estimate_shown_before_sending(env, monkeypatch):
     env.config.update(cli="warn")
     _cold_history(env.plugin, cold=6, warm=4, gap=3600)
     _guard_acts(env, monkeypatch)
-    assert _reply(env) == "Hello\n\n[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
+    _reply(env)
+    assert env.posted == [RESULT_LINE]
 
 
 def test_block_result_line_has_no_warn_marker_and_keeps_estimate(env):
@@ -2404,35 +2416,33 @@ def test_block_result_line_has_no_warn_marker_and_keeps_estimate(env):
     env.approval = lambda *a, **k: "once"
     run_middleware(env)
     note = env.plugin._PENDING.get("s1", "")
-    assert note.startswith("[CACHEGUARD] ") and "WARN" not in note and note.endswith("· chance of loss 60%")
+    assert note.startswith("CGUARD ") and "WARN" not in note and "similar" not in note
 
 
-def test_denial_carries_estimate_and_model_line(env):
-    text = env.plugin._deny_text("s1", gap_s=60, estimate=66, using="using p m1")
-    assert text.splitlines()[0] == "[CACHEGUARD] BLOCKED · message not sent after a 1-minute pause (cancelled) · chance of loss 66%"
-    lines = [line for line in text.splitlines() if line]  # blank lines keep chat markdown from joining them
-    assert lines[1] == "using p m1" and lines[2] == "Send it again, or start /new and paste it. Session ID: s1"
+def test_denial_has_no_estimate(env):
+    text = env.plugin._deny_text("s1", gap_s=60)
+    assert text == ("[CACHEGUARD] BLOCKED · message not sent after a pause of 1 minute (cancelled)\n"
+                    "Send it again, or start /new and paste it. Session ID: s1")
+    assert "lost" not in text and "%" not in text
     assert "session_search" not in text
 
 
 def test_model_change_box_is_affirmative_and_names_the_new_model(env):
-    env.config.update(model_change="block", show_model=True)
+    env.config.update(cli="block")
     seed_session(env, ago=10, model="p/old")
     prompts = []
     env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
     out, called, _ = run_middleware(env, model="new")
     assert not called
     assert prompts[0].startswith("[CACHEGUARD] Model changed\n\np/old → p/new · ~")
-    assert "tokens may reload\nusing p new" in prompts[0] and "full price" not in prompts[0] and "will be" not in prompts[0]
-    assert prompts[0].endswith("\nusing p new")
+    assert prompts[0].endswith("tokens may be rebilled") and "full price" not in prompts[0]
     assert out.choices[0].message.content.splitlines()[0] == "[CACHEGUARD] BLOCKED · message not sent (model changed)"
 
 
 def test_model_change_result_has_no_pause_or_estimate(env):
     row = {"evaluable": False, "cause": "model_switch", "gap_s": 3600.0, "prompt_tokens": 30000,
            "cache_read_tokens": 0}
-    assert env.plugin._outcome_text(row, 66, ("p/old", "p/new")) == (
-        "cache lost · up to 30,000 tokens reloaded · model changed p/old → p/new")
+    assert env.plugin._outcome_text(row, ("p/old", "p/new")) == "cache lost, 30k rebilled, model changed"
 
 
 def test_saved_history_filter_skips_blocked_texts(env):
@@ -2450,39 +2460,20 @@ def test_pause_text_uses_hours_and_days_for_long_pauses(env, seconds, text):
 def test_superscript_digits_in_command_args_do_not_crash(env):
     assert "usage" in env.plugin._cmd_export(["²", "1"]).lower()
     assert isinstance(env.plugin._cmd_debug(["²"]), str)
-    assert "whole number" in env.plugin._cmd_show("set max_observations ²")
-
-
-def test_pause_phrase_is_grammatical(env):
-    phrase = env.plugin._pause_phrase
-    assert [phrase(s) for s in (30, 60, 720, 8 * 60, 11 * 60, 8 * 3600, 3 * 86400)] == [
-        "a 30-second pause", "a 1-minute pause", "a 12-minute pause", "an 8-minute pause",
-        "an 11-minute pause", "an 8-hour pause", "a 3-day pause"]
-
-
-def test_notice_uses_visible_print(env, monkeypatch):
-    import sys
-    import types
-
-    seen = []
-    monkeypatch.setattr(env.plugin, "_CTX", None)
-    monkeypatch.setitem(sys.modules, "cli", types.SimpleNamespace(_cli_visible_print=seen.append))
-    env.plugin._H["noticed"].discard("probe")
-    env.plugin._notice("probe")
-    assert seen and seen[0] == "[CACHEGUARD] probe"
+    assert "number" in env.plugin._cmd_show("set tokens ²")
 
 
 # ------------------------------------------------------- surface groups ---
 @pytest.mark.parametrize("platform", ["cli", "tui", "local", "desktop", "webui", "acp"])
 def test_cli_group_platforms_use_cli_setting(env, platform):
-    env.config.update(cli="warn", gateway="off", min_context_tokens=1000)
+    env.config.update(cli="warn", gateway="off", size_k=1)
     seed_session(env, ago=3600)
     out, called, sentinel = run_middleware(env, platform=platform)
     assert called and out is sentinel and env.warned() is not None
 
 
 def test_desktop_block_prompts_through_gateway_queue(env, monkeypatch):
-    env.config.update(cli="block", gateway="off", min_context_tokens=1000)
+    env.config.update(desktop="block", gateway="off", size_k=1)
     seed_session(env, ago=3600)
     blocked = object()
     monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
@@ -2494,7 +2485,7 @@ def test_desktop_block_prompts_through_gateway_queue(env, monkeypatch):
 
 @pytest.mark.parametrize("platform", ["telegram", "discord", "some-new-chat-app"])
 def test_messaging_and_unknown_platforms_use_gateway_setting(env, platform):
-    env.config.update(cli="block", gateway="warn", min_context_tokens=1000)
+    env.config.update(cli="block", gateway="warn", size_k=1)
     seed_session(env, ago=3600)
     env.approval = lambda *a, **k: pytest.fail("gateway group must not use the CLI box")
     out, called, sentinel = run_middleware(env, platform=platform)
@@ -2504,7 +2495,7 @@ def test_messaging_and_unknown_platforms_use_gateway_setting(env, platform):
 @pytest.mark.parametrize("platform", ["cron", "kanban", "subagent", "api_server", "webhook", "msgraph_webhook"])
 @pytest.mark.parametrize("mode", ["warn", "block"])
 def test_unattended_platforms_are_pure_pass_through(env, platform, mode):
-    env.config.update(cli=mode, gateway=mode, model_change=mode, min_context_tokens=1000)
+    env.config.update(cli=mode, gateway=mode, size_k=1)
     env.approval = lambda *a, **k: pytest.fail("unattended must never prompt")
     seed_session(env, ago=3600)
     before = env.plugin._read_session("s1")
@@ -2520,7 +2511,7 @@ def test_unattended_platforms_are_pure_pass_through(env, platform, mode):
 @pytest.mark.parametrize("var, value", [("HERMES_KANBAN_TASK", "t_42"), ("HERMES_CRON_SESSION", "1")])
 def test_kanban_and_cron_workers_on_cli_are_left_alone(env, monkeypatch, var, value):
     monkeypatch.setenv(var, value)
-    env.config.update(cli="block", min_context_tokens=1000)
+    env.config.update(cli="block", size_k=1)
     env.approval = lambda *a, **k: pytest.fail("unattended must never prompt")
     seed_session(env, ago=3600)
     out, called, sentinel = run_middleware(env, platform="cli", model="new")
@@ -2529,26 +2520,7 @@ def test_kanban_and_cron_workers_on_cli_are_left_alone(env, monkeypatch, var, va
 
 
 # ------------------------------------------------- one line per reply ---
-def test_line_the_model_copied_from_history_is_not_repeated(env, monkeypatch):
-    # Seen on desktop: the model ended its reply with the previous turn's line, then the new line followed.
-    _guard_acts(env, monkeypatch)
-    own = "[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
-    old = "[CACHEGUARD] OK · 18,816 tokens reused after a 1-minute pause · 5% loss est."
-    assert _reply(env, "Hello\n\n" + old) == "Hello\n\n" + own
 
-
-def test_copied_line_with_model_line_is_dropped_too(env, monkeypatch):
-    _guard_acts(env, monkeypatch)
-    own = "[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
-    old = "[CACHEGUARD] OK · 1,000 tokens reused after a 1-minute pause\n\nusing p m0"
-    assert _reply(env, "Hello\n\n" + old) == "Hello\n\n" + own
-
-
-def test_text_without_a_line_is_untouched_and_no_note_means_no_change(env, monkeypatch):
-    _guard_acts(env, monkeypatch)
-    own = "[CACHEGUARD] OK · 59,000 tokens reused after a 60-minute pause"
-    assert _reply(env, "using the tool\n\nDone") == "using the tool\n\nDone\n\n" + own
-    assert _reply(env, "Hello\n\n[CACHEGUARD] old") is None
 
 
 # ----------------------------------------------- CLI box and gateway decisions ---
@@ -2618,14 +2590,14 @@ def _box(env):
     return env.plugin._confirmation_screen({}, "title\n\ndetail", deny, "m")
 
 
-@pytest.mark.parametrize("answer", ["once", "y", " Yes ", "1", "OK", "approve", "send", " Send "])
+@pytest.mark.parametrize("answer", ["once", "y", " Yes ", "1", "OK", "approve"])
 def test_cli_box_typed_send_answers_send(env, answer):
     _hermes_like_owner(env, answer)
     handled, response = _box(env)
     assert handled and response is None
 
 
-@pytest.mark.parametrize("answer", ["deny", "cancel", "no", "n", "3", "2"])
+@pytest.mark.parametrize("answer", ["deny", "cancel", "no", "n", "3"])
 def test_cli_box_typed_cancel_answers_cancel_without_degraded_line(env, answer):
     _hermes_like_owner(env, answer)
     handled, response = _box(env)
@@ -2633,12 +2605,12 @@ def test_cli_box_typed_cancel_answers_cancel_without_degraded_line(env, answer):
     assert not env.plugin._H["noticed"]
 
 
-@pytest.mark.parametrize("answer", ["maybe", "", "  ", "always", "sendit"])
+@pytest.mark.parametrize("answer", ["maybe", "", "  ", "always", "sendit", "send", "2"])
 def test_cli_box_unreadable_answer_sends_nothing_and_shows_degraded_line(env, answer):
     _hermes_like_owner(env, answer)
     handled, response = _box(env)
     assert handled and "message not sent" in response.choices[0].message.content
-    assert [n for n in env.plugin._H["noticed"] if "Send/Cancel box" in n]
+    assert [n for n in env.plugin._H["noticed"] if "cacheguard box" in n]
 
 
 def _cb_box(env, answer, helper_owner=False):
@@ -2689,7 +2661,7 @@ def test_cli_box_unreadable_answer_degraded_line_shows_once(env):
     _hermes_like_owner(env, "maybe")
     _box(env)
     _box(env)
-    assert len([n for n in env.plugin._H["noticed"] if "Send/Cancel box" in n]) == 1
+    assert len([n for n in env.plugin._H["noticed"] if "cacheguard box" in n]) == 1
 
 
 def test_cli_box_without_hermes_helper_keeps_exact_match(env):
@@ -2697,7 +2669,8 @@ def test_cli_box_without_hermes_helper_keeps_exact_match(env):
     handled, response = _box(env)
     assert handled and "message not sent" in response.choices[0].message.content
     _hermes_like_owner(env, "send", helper=False)
-    assert _box(env) == (True, None)
+    handled, response = _box(env)
+    assert handled and "message not sent" in response.choices[0].message.content
     _hermes_like_owner(env, "once", helper=False)
     assert _box(env) == (True, None)
 
@@ -2718,9 +2691,10 @@ def test_health_checks_the_answer_helper(env):
     ({"resolved": True, "choice": "session"}, True, None),
     ({"resolved": True, "choice": "always"}, True, None),
     ({"resolved": True, "choice": "deny"}, False, "(cancelled)"),
+    ({"resolved": True, "choice": None, "cancelled": "turn interrupted"}, False, "(cancelled)"),
     ({"resolved": True, "choice": None}, False, "(cancelled)"),
-    ({"resolved": False, "choice": "once"}, False, "(cancelled)"),
     ({"resolved": False, "choice": None}, False, "timeout"),
+    ({"resolved": False, "choice": None, "notify_failed": True}, False, "could not be delivered"),
 ])
 def test_gateway_decision_only_explicit_allow_sends(env, monkeypatch, decision, sent, word):
     wait = types.ModuleType("tools.approval_gateway_wait")
@@ -2766,7 +2740,7 @@ def test_health_checks_the_other_hermes_symbols(env, monkeypatch, name, symbol):
 def test_setup_refuses_pause_under_one_minute(env):
     ctx = _with_ctx(env)
     out = env.plugin._cmd_show("setup all warn 0.5 30")
-    assert out.startswith("cacheguard: minutes must be a number >= 1.") and ctx.calls == []
+    assert out.startswith("cacheguard: pause_m must be a number >= 1.") and ctx.calls == []
 
 
 def test_help_example_sets_one_group(env):
@@ -2776,7 +2750,7 @@ def test_help_example_sets_one_group(env):
 
 # ------------------------------------------- llm_request: lines kept out of the model's view --
 def _note(p):
-    return "\n\n" + p._PREFIX + " result: 5k reused\n\nusing m1"
+    return "\n\n" + p._PREFIX + " result: 5k reused"
 
 
 def _blocked(p):
@@ -2793,7 +2767,7 @@ def test_request_note_removed_and_model_text_kept(env):
     msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": own + _note(p)}]
     out = _req(p, msgs)["request"]["messages"]
     assert out[1]["content"] == own and out[0] is msgs[0]
-    assert msgs[1]["content"].endswith("using m1")  # input untouched
+    assert msgs[1]["content"].endswith("result: 5k reused")  # input untouched
 
 
 def test_prefix_is_cacheguard_and_not_denied_sql_matches_it(env):
@@ -2944,30 +2918,35 @@ def test_session_env_falls_back_to_os_environ_when_gateway_read_raises(env, monk
     assert env.plugin._session_env("HERMES_SESSION_KEY") == "from-environ"
 
 
-def test_housekeeping_prunes_only_stale_session_json(env):
+def test_housekeeping_keeps_newest_session_files(env, monkeypatch):
     import os
 
+    monkeypatch.setattr(env.plugin, "_MAX_SESSION_FILES", 3)
     d = env.plugin._sessions_dir()
-    stale_age = time.time() - 31 * 86400
-    stale, fresh, other = d / "old.json", d / "new.json", d / "old.txt"
-    for f in (stale, fresh, other):
+    now = time.time()
+    other = d / "other.txt"
+    other.write_text("{}")
+    files = [d / f"s{i}.json" for i in range(5)]
+    for i, f in enumerate(files):  # s0 is the oldest, s4 the newest
         f.write_text("{}")
-    for f in (stale, other):
-        os.utime(f, (stale_age, stale_age))
+        os.utime(f, (now - 1000 + i * 10,) * 2)
     env.plugin._sessions_housekeeping()
-    assert not stale.exists() and fresh.exists() and other.exists()
+    assert [f.exists() for f in files] == [False, False, True, True, True]
+    assert other.exists()
 
 
-def test_housekeeping_runs_once_per_process(env):
+def test_housekeeping_runs_once_per_process(env, monkeypatch):
     import os
 
+    monkeypatch.setattr(env.plugin, "_MAX_SESSION_FILES", 1)
     d = env.plugin._sessions_dir()
     env.plugin._sessions_housekeeping()
-    late = d / "late.json"
-    late.write_text("{}")
-    os.utime(late, (time.time() - 31 * 86400,) * 2)
+    for i, name in enumerate(("a.json", "b.json")):
+        f = d / name
+        f.write_text("{}")
+        os.utime(f, (time.time() - 100 + i,) * 2)
     env.plugin._sessions_housekeeping()
-    assert late.exists()
+    assert (d / "a.json").exists() and (d / "b.json").exists()
 
 
 # --- health: real symbol check ---------------------------------------------------------------
@@ -3061,8 +3040,8 @@ def test_state_db_sessions_table_is_checked(env):
 def test_renamed_symbol_prints_a_degraded_line_and_the_message_is_still_sent(env, monkeypatch):
     monkeypatch.setattr(env.plugin, "_has_symbol", lambda mod, sym: sym != "get_session_env")
     env.plugin._run_health()
-    assert any(line.endswith("cacheguard may treat cron and kanban runs as chats.") for line in env.printed)
-    assert not any("degraded" in line or "session_env" in line for line in env.printed)
+    assert any(line.endswith("cacheguard may treat cron and kanban runs as chats.") for line in env.notices)
+    assert not any("degraded" in line or "session_env" in line for line in env.notices)
     _out, called, _sentinel = run_middleware(env, request={"messages": [{"role": "user", "content": "hi"}], "tools": []})
     assert called is True
 
@@ -3127,28 +3106,12 @@ def _respond(env, ts, prompt=1000, cached=1000, **payload):
         _payload(**payload), {"usage": {"prompt_tokens": prompt, "cache_read_tokens": cached}}, ts - 1, ts)
 
 
-def test_session_recovers_a_newer_journal_response_from_the_tail(env):
-    put_session(env.plugin, "s", {"last_api_ts": 10.0, "model": "p/m1", "api_mode": "chat_completions",
-                                  "prompt_tokens": 500, "guard_sends": {"k": 5}})
-    _write_journal(env, _past_the_tail(env) + [_journal_row("s", ts=5000.0, prompt=7000), _journal_row(ts=5001.0)])
-    rec = env.plugin._get_session("s")
-    assert rec["last_api_ts"] == 5000.0 and rec["prompt_tokens"] == 7000 and rec["guard_sends"] == {"k": 5}
-
-
-def test_a_session_row_outside_the_tail_leaves_the_session_file_as_it_is(env):
-    saved = {"last_api_ts": 10.0, "model": "p/m1", "api_mode": "chat_completions", "prompt_tokens": 500}
-    put_session(env.plugin, "s", dict(saved))
-    _write_journal(env, [_journal_row("s", ts=5000.0, prompt=7000)] + _past_the_tail(env))
-    assert env.plugin._get_session("s") == saved
-
-
 def test_tail_read_survives_a_damaged_last_line_and_a_cut_first_line(env):
     put_session(env.plugin, "s", {"last_api_ts": 10.0, "model": "p/m1", "api_mode": "chat_completions"})
     _write_journal(env, _past_the_tail(env) + [_journal_row("s", ts=5000.0, prompt=7000)],
                    tail_text='{"ts": 1, "session_id": "s", "mod')
     rows, truncated = env.plugin._read_recent_observations()
     assert truncated and rows[-1]["ts"] == 5000.0 and all(isinstance(r, dict) for r in rows)
-    assert env.plugin._get_session("s")["last_api_ts"] == 5000.0
 
 
 def test_session_read_does_not_read_the_whole_journal(env, monkeypatch):
@@ -3178,8 +3141,8 @@ def test_record_counts_early_positive_reads_for_a_zero_read(env):
     assert verdict["evaluable"] is True and verdict["cold"] is True
 
 
-def test_trim_keeps_the_journal_near_its_limit_across_many_records(env):
-    env.settings["max_observations"] = 1000
+def test_trim_keeps_the_journal_near_its_limit_across_many_records(env, monkeypatch):
+    monkeypatch.setattr(env.plugin, "_MAX_OBSERVATIONS", 1000)
     path = _write_journal(env, _filler(1400))  # over the limit when the process starts
     for i in range(400):
         _respond(env, 10_000.0 + i, session_id=f"s{i % 3}", api_request_id=f"q{i}")
@@ -3190,7 +3153,7 @@ def test_trim_keeps_the_journal_near_its_limit_across_many_records(env):
 
 
 def test_trim_runs_on_the_first_record_and_then_only_every_few(env, monkeypatch):
-    env.settings["max_observations"] = 1000
+    monkeypatch.setattr(env.plugin, "_MAX_OBSERVATIONS", 1000)
     _write_journal(env, _filler(1000))
     calls = []
     original = env.plugin._trim_observations
@@ -3200,3 +3163,155 @@ def test_trim_runs_on_the_first_record_and_then_only_every_few(env, monkeypatch)
     assert len(calls) == 1
     _respond(env, 20_000.0, api_request_id="next")
     assert len(calls) == 2
+
+
+# --- notices: posted outside the model context -------------------------------- #
+RESULT_LINE = "CGUARD OK 59k reused, 60 min"
+
+
+def test_result_line_is_posted_and_the_reply_is_left_alone(env, monkeypatch):
+    _guard_acts(env, monkeypatch)
+    assert _reply(env) is None
+    assert env.posted == [RESULT_LINE]
+    assert "s1" not in env.plugin._PENDING
+
+
+def test_result_line_is_posted_once(env, monkeypatch):
+    _guard_acts(env, monkeypatch)
+    _reply(env)
+    _reply(env)
+    assert env.posted == [RESULT_LINE]
+
+
+def test_note_waits_for_its_own_turn(env, monkeypatch):
+    real = env.plugin._queue_note
+    monkeypatch.setattr(env.plugin, "_queue_note", lambda sid, text, turn_id=None: real(sid, text, "t1"))
+    _guard_acts(env, monkeypatch)
+    other = env.plugin._transform_llm_output(
+        response_text="side answer", session_id="s1", model="p/m1", platform="cli", turn_id="t2")
+    assert other is None and env.posted == [] and "s1" in env.plugin._PENDING
+    assert _reply(env) is None and env.posted == [RESULT_LINE]
+
+
+@pytest.mark.parametrize("failure", [False, RuntimeError("boom")])
+def test_post_message_failing_never_raises_and_shows_nothing(env, monkeypatch, failure):
+    env.post_ok = failure
+    _guard_acts(env, monkeypatch)
+    env.plugin._notice("something broke")
+    assert _reply(env) is None
+    assert "s1" not in env.plugin._PENDING  # no fallback: the line is dropped
+    assert env.posted == []
+
+
+def test_without_post_message_nothing_is_shown_and_health_says_so(env, monkeypatch):
+    del env.plugin._CTX.post_message
+    _guard_acts(env, monkeypatch)
+    env.plugin._run_health()
+    assert env.plugin._HEALTH_EFFECTS["post_message"] in env.notices
+    assert "post_message: missing or changed" in env.plugin._health_text()
+    assert _reply(env) is None and "s1" not in env.plugin._PENDING
+
+
+def test_notice_is_posted_once_per_session(env):
+    env.plugin._notice("something broke")
+    assert env.posted == []  # waits for a chat turn
+    assert _reply(env, session_id="s1") is None
+    assert env.posted == ["CGUARD something broke"]
+    _reply(env, session_id="s1")
+    assert env.posted == ["CGUARD something broke"]
+    _reply(env, session_id="s2")
+    assert env.posted == ["CGUARD something broke"] * 2
+
+
+def test_same_notice_is_queued_once_per_process(env):
+    env.plugin._notice("something broke")
+    env.plugin._notice("something broke")
+    assert env.notices == ["something broke"]
+
+
+def test_notice_comes_before_the_result_line(env, monkeypatch):
+    _guard_acts(env, monkeypatch)
+    env.plugin._notice("something broke")
+    _reply(env)
+    assert env.posted == ["CGUARD something broke", RESULT_LINE]
+
+
+def test_notice_retries_after_a_failed_post(env):
+    env.plugin._notice("something broke")
+    env.post_ok = False
+    _reply(env)
+    env.post_ok = True
+    _reply(env)
+    assert env.posted == ["CGUARD something broke"]
+
+
+def test_notice_sessions_are_bounded(env):
+    env.plugin._notice("something broke")
+    for i in range(env.plugin._PENDING_MAX + 10):
+        _reply(env, session_id=f"x{i}")
+    assert len(env.plugin._NOTICES_SEEN) == env.plugin._PENDING_MAX
+
+
+def test_unattended_posts_nothing(env, monkeypatch):
+    _guard_acts(env, monkeypatch)
+    env.plugin._notice("something broke")
+    out = env.plugin._transform_llm_output(
+        response_text="hi", session_id="s1", platform="cron", turn_id="t1")
+    assert out is None and env.posted == [] and "s1" in env.plugin._PENDING
+
+
+def test_notices_is_not_a_setting(env):
+    assert "notices" not in env.plugin.DEFAULTS and "notices" not in env.plugin._HELP_TEXT
+    assert "notices" not in env.plugin._cmd_show("")
+
+
+# --- short posted lines ------------------------------------------------------- #
+@pytest.mark.parametrize("count,text", [
+    (0, "0"), (999, "999"), (1000, "1k"), (1499, "1k"), (1500, "2k"), (23_400, "23k"),
+    (999_499, "999k"), (999_500, "1.0M"), (1_234_567, "1.2M")])
+def test_short_tokens(env, count, text):
+    assert env.plugin._short_tokens(count) == text
+
+
+@pytest.mark.parametrize("seconds,text", [
+    (0, "0 s"), (45, "45 s"), (60, "1 min"), (600, "10 min"), (179 * 60, "179 min"),
+    (180 * 60, "3 h"), (47 * 3600, "47 h"), (48 * 3600, "2 d")])
+def test_compact_pause(env, seconds, text):
+    assert env.plugin._compact_pause(seconds) == text
+
+
+def _short_row(**over):
+    row = {"evaluable": True, "cold": False, "prompt_tokens": 60000, "cache_read_tokens": 23000,
+           "miss_delta": 0, "gap_s": 60.0, "model": "p/m1", "api_mode": "chat_completions"}
+    row.update(over)
+    return row
+
+
+@pytest.mark.parametrize("row,change,text", [
+    (_short_row(), None, "23k reused, 1 min"),
+    (_short_row(gap_s=None), None, "23k reused"),
+    (_short_row(cold=True, miss_delta=23000, gap_s=600.0), None, "cache lost, 23k rebilled, 10 min"),
+    (_short_row(cache_read_tokens=58000), ("a/x", "b/y"), "58k reused, model changed"),
+    (_short_row(prompt_tokens=None), ("a/x", "b/y"), "cache unknown, model changed"),
+    (_short_row(prompt_tokens=60000, cache_read_tokens=0), ("a/x", "b/y"),
+     "cache lost, 60k rebilled, model changed"),
+    (_short_row(evaluable=False, cause="start"), None, "cache unknown, first call"),
+    (_short_row(evaluable=False, cause="usage_missing"), None, "cache unknown, usage unavailable, 1 min"),
+    (_short_row(evaluable=False, cause="rewrite"), None, "cache unknown, context changed, 1 min"),
+    (_short_row(evaluable=False, cause="auxiliary"), None, "cache unknown, background task, 1 min"),
+    (_short_row(evaluable=False, api_mode="unknown"), None, "cache unknown, provider unknown, 1 min"),
+    (_short_row(evaluable=False, cache_read_tokens=0), None, "cache unknown, too few cache hits, 1 min"),
+    (_short_row(evaluable=False), None, "cache unknown, little history, 1 min"),
+])
+def test_outcome_text(env, row, change, text):
+    assert env.plugin._outcome_text(row, change) == text
+
+
+def test_warn_tag_is_short(env, monkeypatch):
+    _guard_acts(env, monkeypatch, cached=0)
+    env.plugin._WARNED["s1"] = True
+    row = {"evaluable": True, "cold": True, "miss_delta": 23000, "gap_s": 600.0,
+           "prompt_tokens": 60000, "cache_read_tokens": 0}
+    env.plugin._PENDING.clear()
+    env.plugin._queue_outcome({"session_id": "s1"}, True, row)
+    assert env.plugin._PENDING["s1"] == "CGUARD WARN cache lost, 23k rebilled, 10 min"

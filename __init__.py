@@ -2,11 +2,11 @@
 
 The first API call of each turn is guarded using context-size and idle-time
 thresholds. Cache availability is unknown before the provider call; the box
-shows only a rough chance of loss from past pauses. In block mode, deny or timeout ends the turn
-without calling the provider.
+shows only how often the cache was lost after similar pauses before. In block mode,
+deny or timeout ends the turn without calling the provider.
 
-Works in the Hermes CLI and in chat apps. CLI, TUI, desktop app, Web UI and
-Telegram: tested. Editor (ACP) and other chat apps: should work, not yet tested.
+Works in the Hermes CLI and in the gateway. CLI, TUI, desktop app, Web UI and
+Telegram: tested. Editor (ACP) and other gateway platforms: should work, not yet tested.
 Bot Chat is left alone.
 
 The llm_execution middleware records normalized usage from every response, with
@@ -20,7 +20,9 @@ Plugin failures allow the provider call to proceed.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -40,38 +42,25 @@ except ImportError:  # Windows
     import msvcrt
 
 DEFAULTS: Dict[str, Any] = {
-    "enabled": True,
-    "cli": "warn",  # terminal, TUI, editor
-    "desktop": None,  # desktop app, web UI; unset = cli
+    "cli": "warn",  # terminal, editor
+    "desktop": "warn",  # desktop app, web UI
     "gateway": "off",  # Telegram and other messaging chats
-    "show_model": False,  # name the model in the confirm box and the result line
     "display_on_success": False,  # show the result line when the cache was kept (loss and unknown always show)
-    "model_change": None,  # model/provider/API differs: off | warn | block; unset = selected surface mode
-    "min_context_tokens": 20000,
-    "min_gap_seconds": 600,
-    "max_observations": 10000,  # journal rows kept; trimmed once 10% over
+    "size_k": 20,  # thousands of tokens
+    "pause_m": 10,
 }
+_MAX_OBSERVATIONS = 10000  # journal rows kept; trimmed once 10% over
 
 
-# SQL: skip our own "message NOT sent" replies (any prefix, old and new wording).
-_NOT_DENY_SQL = (
-    "content NOT LIKE 'cacheguard: message NOT sent%' "
-    "AND content NOT LIKE '[cacheguard] message NOT sent%' "
-    "AND content NOT LIKE '%MESSAGE NOT SENT%To keep this chat:%' "
-    "AND content NOT LIKE '%MESSAGE NOT SENT%Recover after%' "
-    "AND content NOT LIKE '%BLOCKED · message not sent%'"
-)
+# SQL: skip our own "message not sent" replies.
+_NOT_DENY_SQL = "content NOT LIKE '%BLOCKED · message not sent%'"
 
 
 # --------------------------------------------------------------------------- #
 # config / paths
 # --------------------------------------------------------------------------- #
 _PREFIX = "[CACHEGUARD]"  # the ONE prefix of every line cacheguard adds to a chat
-
-
-def _model_change_mode(cfg: Dict[str, Any], surface_mode: Any = None) -> Any:
-    return cfg.get("model_change") if cfg.get("model_change") is not None else (
-        surface_mode if surface_mode is not None else cfg.get("cli"))
+_POST_PREFIX = "CGUARD"  # prefix of the short posted notices (the TUI status bar cuts them at ~45 characters)
 
 
 _BOT_CHAT: Dict[Tuple[str, str], bool] = {}  # (home, session_id) -> answer, so SQLite opens once per session
@@ -149,7 +138,7 @@ def _is_cli_platform(payload: Dict[str, Any]) -> bool:
 
 def _surface_mode(payload: Dict[str, Any], cfg: Dict[str, Any]) -> Any:
     if _platform(payload) in _DESKTOP_PLATFORMS:
-        return cfg["desktop"] if cfg["desktop"] is not None else cfg["cli"]
+        return cfg["desktop"]
     return cfg["cli"] if _is_cli_platform(payload) else cfg["gateway"]
 
 
@@ -165,19 +154,27 @@ def _finite_number(value: Any) -> bool:
 def _known_settings(section: Dict[str, Any]) -> Dict[str, Any]:
     """Settings this plugin knows."""
     known = {k: v for k, v in section.items() if k in DEFAULTS}
-    for key in ("cli", "desktop", "gateway", "model_change"):
+    for key in ("cli", "desktop", "gateway"):
         if known.get(key) is False:  # YAML 1.1 reads an unquoted `off` as False
             known[key] = "off"
-        elif isinstance(known.get(key), str):
-            known[key] = known[key].strip().lower()
-    flag = known.get("enabled")
-    if isinstance(flag, str) and flag.strip().lower() in ("false", "no", "off", "0"):
-        known["enabled"] = False
-    elif isinstance(flag, str) and flag.strip().lower() in ("true", "yes", "on", "1"):
-        known["enabled"] = True
-    elif not isinstance(flag, bool) and _finite_number(flag) and flag in (0, 1):
-        known["enabled"] = bool(flag)
     return known
+
+
+def _valid_number(name: str, value: Any) -> bool:
+    """The one rule for pause_m and size_k, in config.yaml and in `/cacheguard set`."""
+    if not _finite_number(value):
+        return False
+    if name == "pause_m":
+        return value >= 1 and math.isfinite(float(value) * 60)
+    return 0 <= value <= 2000  # size_k: thousands of tokens
+
+
+def _pause_seconds(pause_m: Any) -> float:
+    return float(pause_m) * 60
+
+
+def _size_tokens(size_k: Any) -> int:
+    return round(float(size_k) * 1000)
 
 
 def _raw_config() -> Dict[str, Any]:
@@ -196,12 +193,7 @@ def _cfg() -> Dict[str, Any]:
         raw = _raw_config()
         if not isinstance(raw, dict):
             raise TypeError("configuration root is not a mapping")
-        section = raw.get("cacheguard")
-        if section is not None and not isinstance(section, dict):
-            errors.add("invalid cacheguard section; using defaults")
-        if isinstance(section, dict):
-            cfg.update(_known_settings(section))
-        # Official place (written by `/cacheguard set`): plugins.entries.cacheguard.settings
+        # The one place (written by `/cacheguard set`): plugins.entries.cacheguard.settings
         plugins = raw.get("plugins")
         if plugins is not None and not isinstance(plugins, dict):
             errors.add("invalid official cacheguard settings; using defaults")
@@ -226,32 +218,14 @@ def _cfg() -> Dict[str, Any]:
         cfg[key] = DEFAULTS[key]
         errors.add(f"invalid {key}; using default")
 
-    if not isinstance(cfg["enabled"], bool):
-        invalid("enabled")
-    if not isinstance(cfg["show_model"], bool):
-        invalid("show_model")
     if not isinstance(cfg["display_on_success"], bool):
         invalid("display_on_success")
-    for key in ("cli", "gateway"):
+    for key in ("cli", "desktop", "gateway"):
         if not isinstance(cfg[key], str) or cfg[key] not in ("off", "warn", "block"):
             invalid(key)
-    if cfg["desktop"] is not None and (
-        not isinstance(cfg["desktop"], str) or cfg["desktop"] not in ("off", "warn", "block")
-    ):
-        invalid("desktop")
-    if cfg["model_change"] is not None and (
-        not isinstance(cfg["model_change"], str) or cfg["model_change"] not in ("off", "warn", "block")
-    ):
-        invalid("model_change")
-    for key in ("min_context_tokens", "min_gap_seconds"):
-        value = cfg[key]
-        if (not _finite_number(value) or value < 0
-                or (key == "min_context_tokens" and int(value) != value)):
+    for key in ("pause_m", "size_k"):
+        if not _valid_number(key, cfg[key]):
             invalid(key)
-    value = cfg["max_observations"]
-    if not _finite_number(value) or int(value) != value or value < 1000:
-        invalid("max_observations")
-    cfg["max_observations"] = int(cfg["max_observations"])
     _set_config_errors(errors)
     return cfg
 
@@ -300,7 +274,7 @@ def _model_key(provider: Optional[str], model: Optional[str]) -> str:
 # --------------------------------------------------------------------------- #
 # storage (tiny, append-only, never raises)
 # --------------------------------------------------------------------------- #
-_SESSION_TTL_S = 30 * 86400
+_MAX_SESSION_FILES = 200  # chat tracking files kept, newest first
 _sessions_housekeeping_done = False
 
 
@@ -378,59 +352,37 @@ def _write_private_text(path: Path, text: str) -> None:
 
 
 def _sessions_housekeeping() -> None:
-    """Once per process: prune stale session files."""
+    """Once per process: keep the newest session files, delete the older ones."""
     global _sessions_housekeeping_done
     if _sessions_housekeeping_done:
         return
     _sessions_housekeeping_done = True
     try:
-        cutoff = time.time() - _SESSION_TTL_S
+        files = []
         for f in _sessions_dir().glob("*.json"):
             try:
-                if f.stat().st_mtime < cutoff:
-                    f.unlink()
+                files.append((f.stat().st_mtime, f))
+            except Exception:
+                continue
+        files.sort(key=lambda x: x[0], reverse=True)
+        for _, f in files[_MAX_SESSION_FILES:]:
+            try:
+                f.unlink()
             except Exception:
                 continue
     except Exception:
         pass
 
 
-def _read_session(session_id: str, recent: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """The session record, with a newer response recovered from the end of the journal.
-
-    `recent`: journal rows already read by the caller (_read_recent_observations).
-    """
+def _read_session(session_id: str) -> Dict[str, Any]:
+    """The session's own record. Missing or broken file: empty, so the guard stays silent."""
     _sessions_housekeeping()
     try:
         with open(_session_file(session_id), "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        data = data if isinstance(data, dict) else {}
+        return data if isinstance(data, dict) else {}
     except (FileNotFoundError, ValueError):
-        data = {}
-    # The append-only journal survives a failed session-file replacement.
-    # Recover its newer response without dropping persisted consent cooldowns.
-    # Only the newest rows are read: a response newer than the session file is among them
-    # (and if not, the session file is trusted as it is).
-    rows = _read_recent_observations()[0] if recent is None else recent
-    polluted = any(row.get("session_id") == session_id and _is_auxiliary(row)
-                   and row.get("ts") == data.get("last_api_ts") for row in rows)
-    if polluted:
-        for field in ("last_api_ts", "model", "api_mode", "prompt_tokens"):
-            data.pop(field, None)
-    for row in reversed(rows):
-        if row.get("session_id") != session_id or "api_mode" not in row or _is_auxiliary(row):
-            continue
-        prior_ts = data.get("last_api_ts")
-        if not polluted and _finite_number(prior_ts) and row["ts"] <= prior_ts:
-            break
-        data.update(last_api_ts=row["ts"], model=row["model"], api_mode=row["api_mode"])
-        for previous in reversed(rows):
-            if (previous.get("session_id") == session_id and not _is_auxiliary(previous)
-                    and previous.get("prompt_tokens") is not None):
-                data["prompt_tokens"] = previous["prompt_tokens"]
-                break
-        break
-    return data
+        return {}
 
 
 def _get_session(session_id: str) -> Dict[str, Any]:
@@ -441,35 +393,7 @@ def _get_session(session_id: str) -> Dict[str, Any]:
         return {}
 
 
-def _last_assistant_ts(session_id: str) -> Optional[float]:
-    """Time of the session's last assistant message, from Hermes' state.db.
-
-    Fallback for sessions this plugin never saw (created before it was enabled,
-    or after /cacheguard reset): without it, resuming an old session looks like
-    "no previous call" and the guard stays silent exactly when it matters.
-    """
-    if not session_id or not _healthy("state_db"):
-        return None
-    try:
-        import sqlite3
-
-        from hermes_constants import get_hermes_home
-
-        con = sqlite3.connect(_state_db_uri(get_hermes_home()), uri=True, timeout=1.0)
-        try:
-            row = con.execute(
-                "SELECT MAX(timestamp) FROM messages WHERE session_id = ? AND role = 'assistant' "
-                "AND (content IS NULL OR (" + _NOT_DENY_SQL + "))",
-                (session_id,),
-            ).fetchone()
-        finally:
-            con.close()
-        return float(row[0]) if row and row[0] else None
-    except Exception:
-        return None
-
-
-_obs_cache: Optional[tuple] = None  # ((mtime_ns, size), rows)
+_obs_cache: Optional[tuple] = None  # ((path, mtime_ns, size), rows)
 
 
 def _write_observation(row: Dict[str, Any]) -> None:
@@ -552,11 +476,7 @@ def _parse_observation_lines(lines: List[bytes]) -> Tuple[List[Dict[str, Any]], 
                 not _finite_number(value) or value < 0
             ):
                 bad = True
-        if "cold" in row and row["cold"] is not None and not isinstance(row["cold"], bool):
-            bad = True
         if "task_id" in row and (not isinstance(row["task_id"], str) or not row["task_id"]):
-            bad = True
-        if "stat_eligible" in row and not isinstance(row["stat_eligible"], bool):
             bad = True
         for field in ("prompt_tokens", "cache_read_tokens", "cache_write_tokens", "prev_prompt_tokens"):
             value = row.get(field)
@@ -564,25 +484,22 @@ def _parse_observation_lines(lines: List[bytes]) -> Tuple[List[Dict[str, Any]], 
                 not _finite_number(value) or value < 0
             ):
                 bad = True
-        if row.get("cold", False) is None and row.get("stat_eligible") is not False:
+        required = ("ts", "session_id", "model", "api_mode", "api_request_id", "gap_s",
+                    "prompt_tokens", "cache_read_tokens", "cache_write_tokens", "prev_prompt_tokens", "cause")
+        if (not all(field in row for field in required)
+                or not isinstance(row.get("api_mode"), str) or not row.get("api_mode")
+                or not isinstance(row.get("model"), str) or "/" not in row.get("model", "")
+                or not isinstance(row.get("session_id"), str)
+                or not isinstance(row.get("api_request_id"), str)
+                or row.get("cause") not in (None, "start", "rewrite", "model_switch", "usage_missing", "auxiliary")):
             bad = True
-        if any(field in row for field in ("api_mode", "prev_prompt_tokens", "cause")):
-            required = ("ts", "session_id", "model", "api_mode", "api_request_id", "gap_s",
-                        "prompt_tokens", "cache_read_tokens", "cache_write_tokens", "prev_prompt_tokens", "cause")
-            if (not all(field in row for field in required)
-                    or not isinstance(row.get("api_mode"), str) or not row.get("api_mode")
-                    or not isinstance(row.get("model"), str) or "/" not in row.get("model", "")
-                    or not isinstance(row.get("session_id"), str)
-                    or not isinstance(row.get("api_request_id"), str)
-                    or row.get("cause") not in (None, "start", "rewrite", "model_switch", "usage_missing", "auxiliary")):
-                bad = True
-            tokens = [row.get(f) for f in ("prompt_tokens", "cache_read_tokens", "cache_write_tokens")]
-            if any(t is None for t in tokens) != all(t is None for t in tokens):
-                bad = True
-            if any(t is not None and (not isinstance(t, int) or isinstance(t, bool)) for t in tokens):
-                bad = True
-            if all(t is None for t in tokens) and row.get("cause") not in ("usage_missing", "auxiliary"):
-                bad = True
+        tokens = [row.get(f) for f in ("prompt_tokens", "cache_read_tokens", "cache_write_tokens")]
+        if any(t is None for t in tokens) != all(t is None for t in tokens):
+            bad = True
+        if any(t is not None and (not isinstance(t, int) or isinstance(t, bool)) for t in tokens):
+            bad = True
+        if all(t is None for t in tokens) and row.get("cause") not in ("usage_missing", "auxiliary"):
+            bad = True
         if bad:
             invalid_rows = True
             continue
@@ -596,7 +513,7 @@ def _read_observations() -> List[Dict[str, Any]]:
     try:
         path = _obs_path()
         st = path.stat()
-        key = (st.st_mtime_ns, st.st_size)
+        key = (str(path), st.st_mtime_ns, st.st_size)
         if _obs_cache and _obs_cache[0] == key:
             return list(_obs_cache[1])
         with open(path, "rb") as fh:
@@ -613,7 +530,7 @@ def _read_observations() -> List[Dict[str, Any]]:
         return []
 
 
-_TAIL_BYTES = 256 * 1024  # how much of the journal's end _read_session / _record_response read
+_TAIL_BYTES = 256 * 1024  # how much of the journal's end _record_response reads
 
 
 def _read_tail_lines() -> Tuple[List[bytes], bool]:
@@ -704,10 +621,10 @@ def score_risk(state: Dict[str, Any], pre_payload: Dict[str, Any]) -> Dict[str, 
     settings = payload.get("settings")
     settings = settings if isinstance(settings, dict) else {}
 
-    raw_floor = settings.get("min_context_tokens", DEFAULTS["min_context_tokens"])
-    floor = int(raw_floor) if _finite_number(raw_floor) and raw_floor >= 0 else DEFAULTS["min_context_tokens"]
-    raw_window = settings.get("min_gap_seconds", DEFAULTS["min_gap_seconds"])
-    window = float(raw_window) if _finite_number(raw_window) and raw_window >= 0 else DEFAULTS["min_gap_seconds"]
+    raw_floor = settings.get("size_k", DEFAULTS["size_k"])
+    floor = _size_tokens(raw_floor if _valid_number("size_k", raw_floor) else DEFAULTS["size_k"])
+    raw_window = settings.get("pause_m", DEFAULTS["pause_m"])
+    window = _pause_seconds(raw_window if _valid_number("pause_m", raw_window) else DEFAULTS["pause_m"])
 
     request = payload.get("request")
     if not isinstance(request, dict) and any(
@@ -736,11 +653,9 @@ def score_risk(state: Dict[str, Any], pre_payload: Dict[str, Any]) -> Dict[str, 
 
     now = payload.get("now", payload.get("now_ts"))
     last = session.get("last_api_ts")
-    # A stored time in the future (clock went back) tells nothing: pause unknown, use the fallback.
+    # A stored time in the future (clock went back) tells nothing: pause unknown.
     if not (_finite_number(last) and last >= 0) or (_finite_number(now) and last > now):
-        last = payload.get("fallback_last_assistant_ts")
-        if _finite_number(now) and _finite_number(last) and last > now:
-            last = None
+        last = None
     touched = session.get("cache_touch_ts")
     if _finite_number(touched) and _finite_number(last) and touched > last and not (
             _finite_number(now) and touched > now):
@@ -822,7 +737,6 @@ def _on_llm_execution(**kwargs: Any) -> Any:
         _PENDING.pop(sid, None)  # a new turn starts: drop a line left by a turn that had no reply text
         _PENDING_TURN.pop(sid, None)
         _WARNED.pop(sid, None)  # and a warning left by a turn whose provider call failed
-        _ESTIMATE.pop(sid, None)
         _CHANGED.pop(sid, None)
     try:
         if next_call is None:
@@ -835,18 +749,16 @@ def _on_llm_execution(**kwargs: Any) -> Any:
             # A different model/provider can never reuse the old cache, whatever the idle gap.
             size, prev, model = changed
             note = f"model changed {prev} → {model}"
-            using = _using_line(model) if cfg["show_model"] else None
             command = (
                 f"{_PREFIX} Model changed\n\n"
-                f"{prev} → {model} · ~{size:,} tokens may reload"
-                + (f"\n{using}" if using else "")
+                f"{prev} → {model} · ~{size:,} tokens may be rebilled"
             )
             deny = lambda outcome, timeout: _deny_text(  # noqa: E731
                 kwargs.get("session_id"), gateway=not is_cli, outcome=outcome, timeout=timeout,
-                cause="model changed", using=using)
+                cause="model changed")
             if isinstance(sid, str) and sid:
                 _CHANGED[sid] = (prev, model)
-            blocked = _act(kwargs, is_cli, _model_change_mode(cfg, surface_mode), note, command, deny, model, box)
+            blocked = _act(kwargs, is_cli, surface_mode, note, command, deny, model, box)
             if blocked is not None:
                 return blocked
             acted = True
@@ -854,14 +766,11 @@ def _on_llm_execution(**kwargs: Any) -> Any:
             triggered = None if auxiliary else _evaluate(kwargs, cfg, surface_mode)
             if triggered:
                 size, model, gap_s = triggered
-                estimate = _cold_chance(model, gap_s)
-                using = _using_line(model) if cfg["show_model"] else None
-                command = _cache_cost_text(size, gap_s, using, estimate)
+                estimate = _cold_counts(model, gap_s)
+                command = _cache_cost_text(size, gap_s, estimate)
                 deny = lambda outcome, timeout: _deny_text(  # noqa: E731
                     kwargs.get("session_id"), gateway=not is_cli, gap_s=gap_s, outcome=outcome,
-                    timeout=timeout, estimate=estimate, using=using)
-                if isinstance(sid, str) and sid and estimate is not None:
-                    _ESTIMATE[sid] = estimate
+                    timeout=timeout)
                 blocked = _act(kwargs, is_cli, surface_mode, "", command, deny, model, box)
                 if blocked is not None:
                     return blocked  # turn ends WITHOUT calling the provider
@@ -887,11 +796,10 @@ def _on_llm_execution(**kwargs: Any) -> Any:
     response = next_call()
     response_ts = time.time()
     try:
-        if cfg["enabled"] and not isinstance(response, _SyntheticResponse):
+        if not isinstance(response, _SyntheticResponse):
             verdict = _record_response(kwargs, response, dispatch_ts, response_ts)
             if acted:
-                _queue_outcome(kwargs, is_cli, verdict, bool(cfg.get("show_model")),
-                               bool(cfg.get("display_on_success")))
+                _queue_outcome(kwargs, is_cli, verdict, bool(cfg.get("display_on_success")))
     except Exception:
         pass
     return response
@@ -929,6 +837,8 @@ def detect_observation(state: Dict[str, Any], attempt: Dict[str, Any]) -> Dict[s
         cause = "model_switch"
     elif not exact_session or previous is None:
         cause = "start"
+    elif attempt.get("prefix_changed") is True:  # the start of the chat is not what the last call sent
+        cause = "rewrite"
     elif prompt is not None and prompt < previous and previous - prompt > _TRIM_TOLERANCE * previous:
         cause = "rewrite"
     else:
@@ -952,14 +862,29 @@ def detect_observation(state: Dict[str, Any], attempt: Dict[str, Any]) -> Dict[s
     }
 
 
+_COLD_SHARE = 0.30  # a call that reloads at least this share of the prompt lost the cache
+
+
+def _cache_lost(reloaded: int, baseline: int) -> bool:
+    """The one "cache lost" rule, for every turn."""
+    return reloaded >= _COLD_SHARE * baseline
+
+
+def _reloaded_on_change(row: Dict[str, Any]) -> Optional[int]:
+    """Tokens a model-change turn had to reload ("up to": the new message was never cached),
+    or None when the call reported no usage."""
+    prompt, read = row.get("prompt_tokens"), row.get("cache_read_tokens")
+    if _finite_number(prompt) and _finite_number(read) and prompt > 0:
+        return max(0, int(prompt) - int(read))
+    return None
+
+
 def evaluate_observations(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Return read-time verdicts, preserving source rows and append order."""
     result = []
     positive_reads = {}
     for source in rows:
         row = dict(source)
-        exact = all(field in source for field in ("api_mode", "prev_prompt_tokens", "cause"))
-        approximate = not exact
         prompt, read, expected = (source.get("prompt_tokens"), source.get("cache_read_tokens"),
                                   source.get("prev_prompt_tokens"))
         model, mode = source.get("model"), source.get("api_mode")
@@ -968,7 +893,7 @@ def evaluate_observations(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         and model.split("/", 1)[1] not in ("", "unknown")
                         and isinstance(mode, str) and mode not in ("", "unknown"))
         auxiliary = _is_auxiliary(source)
-        evaluable = bool(exact and known_domain and not auxiliary and source.get("cause") is None
+        evaluable = bool(known_domain and not auxiliary and source.get("cause") is None
                          and isinstance(expected, int) and not isinstance(expected, bool) and expected > 0
                          and isinstance(prompt, int) and not isinstance(prompt, bool) and prompt >= 0
                          and isinstance(read, int) and not isinstance(read, bool) and read >= 0)
@@ -977,13 +902,12 @@ def evaluate_observations(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             domain = (source.get("model"), source.get("api_mode"))
             evaluable = positive_reads.get(domain, 0) >= 3
         delta = max(0, expected - read) if evaluable else None
-        cold = delta >= 0.30 * expected if evaluable else None
+        cold = _cache_lost(delta, expected) if evaluable else None
         if evaluable:  # never report more rebilled than was sent
             delta = max(0, min(delta, min(expected, prompt) - read))
-        row.update(approximate=approximate, comparable=comparable,
-                   evaluable=evaluable, miss_delta=delta, cold=cold)
+        row.update(comparable=comparable, evaluable=evaluable, miss_delta=delta, cold=cold)
         result.append(row)
-        if exact and known_domain and not auxiliary:
+        if known_domain and not auxiliary:
             value = source.get("cache_read_tokens")
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 domain = (source.get("model"), source.get("api_mode"))
@@ -991,26 +915,40 @@ def evaluate_observations(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
-def _outcome_text(row: Dict[str, Any], estimate: Optional[int] = None,
-                  change: Optional[Tuple[str, str]] = None) -> str:
-    """This held attempt's measurement as one line, without inventing a verdict.
+def _short_tokens(count: int) -> str:
+    """23k, 999, 1.2M (nearest thousand; exact under 1,000)."""
+    count = max(0, int(count))
+    if count < 1000:
+        return str(count)
+    thousands = (count + 500) // 1000
+    if thousands < 1000:
+        return f"{thousands}k"
+    return f"{count / 1_000_000:.1f}M"
 
-    estimate: the loss chance shown before sending, if known. change: (previous, new) model
-    when the turn switched models; the pause means nothing then, so it is left out.
-    """
+
+def _compact_pause(gap_s: float) -> str:
+    """45 s, 1 min, 2 h, 3 d (same steps as _pause_text)."""
+    seconds = max(0, int(gap_s))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 180 * 60:
+        return f"{seconds // 60} min"
+    if seconds < 48 * 3600:
+        return f"{seconds // 3600} h"
+    return f"{seconds // 86400} d"
+
+
+def _outcome_text(row: Dict[str, Any], change: Optional[Tuple[str, str]] = None) -> str:
+    """This held attempt's measurement as one short line (the TUI status bar cuts at ~45 characters)."""
     gap = row.get("gap_s")
-    pause = f" after {_pause_phrase(gap)}" if _finite_number(gap) and change is None else ""
-    est = f" · chance of loss {estimate}%" if estimate is not None and change is None else ""
+    pause = f", {_compact_pause(gap)}" if _finite_number(gap) and change is None else ""
     if change is not None:
-        moved = f" · model changed {change[0]} → {change[1]}"
-        prompt, read = row.get("prompt_tokens"), row.get("cache_read_tokens")
-        if _finite_number(prompt) and _finite_number(read) and prompt > 0:
-            # "up to": prompt - read also counts the new message, which was never cached.
-            reloaded = max(0, int(prompt) - int(read))
-            if reloaded >= 0.30 * prompt:
-                return f"cache lost · up to {reloaded:,} tokens reloaded{moved}"
-            return f"{int(read):,} tokens reused{moved}"
-        return f"Cache status unknown{moved}"
+        reloaded = _reloaded_on_change(row)
+        if reloaded is None:
+            return "cache unknown, model changed"
+        if _cache_lost(reloaded, row["prompt_tokens"]):
+            return f"cache lost, {_short_tokens(reloaded)} rebilled, model changed"
+        return f"{_short_tokens(row['cache_read_tokens'])} reused, model changed"
     if not row["evaluable"]:
         reason = {
             "usage_missing": "usage unavailable",
@@ -1019,27 +957,25 @@ def _outcome_text(row: Dict[str, Any], estimate: Optional[int] = None,
             "auxiliary": "background task",
         }.get(row.get("cause"))
         if row.get("cause") == "start":
-            return "Cache status unknown · first call, nothing to compare yet"
+            return "cache unknown, first call"
         if reason is None:
-            if row.get("approximate"):
-                reason = "older measurement"
-            elif row.get("prompt_tokens") is None or row.get("cache_read_tokens") is None:
+            if row.get("prompt_tokens") is None or row.get("cache_read_tokens") is None:
                 reason = "usage unavailable"
             elif (not row.get("api_mode") or row.get("api_mode") == "unknown"
                   or not isinstance(row.get("model"), str) or "/" not in row["model"]
                   or any(part in ("", "unknown") for part in row["model"].split("/", 1))):
-                reason = "provider or API unknown"
+                reason = "provider unknown"
             elif row.get("cache_read_tokens") == 0:
-                return f"Cache status unknown{pause} · not enough earlier cache hits to judge{est}"
+                reason = "too few cache hits"
             else:
-                reason = "insufficient cache history"
-        return f"Cache status unknown{pause} · {reason}{est}"
+                reason = "little history"
+        return f"cache unknown, {reason}{pause}"
     if row["cold"]:
-        return f"cache lost · {row['miss_delta']:,} tokens reloaded"
-    return f"{row['cache_read_tokens']:,} tokens reused{pause}"
+        return f"cache lost, {_short_tokens(row['miss_delta'])} rebilled{pause}"
+    return f"{_short_tokens(row['cache_read_tokens'])} reused{pause}"
 
 
-_PENDING: Dict[str, str] = {}  # session_id -> note to append to that session's next reply
+_PENDING: Dict[str, str] = {}  # session_id -> note to post after that session's next reply
 _PENDING_TURN: Dict[str, str] = {}  # session_id -> turn_id the note belongs to (when known)
 _PENDING_MAX = 64
 
@@ -1059,32 +995,32 @@ def _queue_note(session_id: Any, text: str, turn_id: Any = None) -> None:
 
 
 def _queue_outcome(kwargs: Dict[str, Any], is_cli: bool, row: Dict[str, Any],
-                   show_model: bool = False, display_on_success: bool = False) -> None:
-    """Keep the result line for transform_llm_output; after a warning it starts with `OK ·` (cache reused) or `WARN ·`.
+                   display_on_success: bool = False) -> None:
+    """Keep the result line for transform_llm_output; after a warning it starts with `OK` (cache reused) or `WARN`.
 
-    With display_on_success off, a kept cache (evaluable, not cold, same model) queues nothing.
+    With display_on_success off, a kept cache (not lost) queues nothing.
     """
     sid = kwargs.get("session_id")
     warned = _WARNED.pop(sid, None) if isinstance(sid, str) else None
-    estimate = _ESTIMATE.pop(sid, None) if isinstance(sid, str) else None
     change = _CHANGED.pop(sid, None) if isinstance(sid, str) else None
     # A reused cache after a warning is good news: say OK, keep WARN for a loss or an unknown.
-    reused = row.get("evaluable") and not row.get("cold")
-    if reused and change is None and not display_on_success:
+    if change is None:
+        reused = row.get("evaluable") and not row.get("cold")
+    else:
+        reloaded = _reloaded_on_change(row)
+        reused = reloaded is not None and not _cache_lost(reloaded, row["prompt_tokens"])
+    if reused and not display_on_success:
         return  # cache kept and nothing else to say; state above is already popped
-    tag = "" if warned is None else ("OK · " if reused else "WARN · ")
+    tag = "" if warned is None else ("OK " if reused else "WARN ")
     if change is None and _reports_no_cache(row):
         model = row.get("model")
         if model in _NO_CACHE_SAID:
             return  # said once per model and process; after that, silence
         _NO_CACHE_SAID.add(model)
-        body = "Cache status unknown · this model does not report a cache"
+        body = "cache unknown, model reports no cache"
     else:
-        body = _outcome_text(row, estimate, change)
-    text = _PREFIX + " " + tag + body
-    if show_model:
-        text += "\n\n" + _using_line(_model_key(kwargs.get("provider"), kwargs.get("model")))
-    _queue_note(sid, text, kwargs.get("turn_id"))
+        body = _outcome_text(row, change)
+    _queue_note(sid, f"{_POST_PREFIX} {tag}{body}", kwargs.get("turn_id"))
 
 
 _NO_CACHE_SAID: set = set()  # models already reported as "does not report a cache" (this process)
@@ -1110,40 +1046,69 @@ def _reports_no_cache(row: Dict[str, Any]) -> bool:
 
 
 _WARNED: Dict[str, str] = {}  # session_id -> warn-mode marker, shown with the result
-_ESTIMATE: Dict[str, int] = {}  # session_id -> loss chance (%) shown before sending, for the result
 _CHANGED: Dict[str, Tuple[str, str]] = {}  # session_id -> (previous, new) model of a model-change turn
 
 
 def _without_old_lines(text: str) -> str:
-    """Drop cacheguard lines the model copied from earlier replies, so a reply carries only its own."""
+    """Drop `[CACHEGUARD]` lines from a saved reply (history cleaning, see _clean_history).
+
+    Old chats still hold such lines, written when cacheguard appended them to replies. Keep the
+    strip: removing it would change their history and cost a cache rebill."""
     paras = text.split("\n\n")
     start = len(paras)
-    while start > 0 and (paras[start - 1].startswith(_PREFIX) or paras[start - 1].startswith(_USING_PREFIX)):
+    while start > 0 and paras[start - 1].startswith(_PREFIX):
         start -= 1
-    while start < len(paras) and not paras[start].startswith(_PREFIX):
-        start += 1  # a "using ..." paragraph with no line before it is the model's own text
     return "\n\n".join(paras[:start]) if start < len(paras) else text
 
 
-def _transform_llm_output(**kwargs: Any) -> Any:
-    """Append the pending note to the reply (Hermes transform_llm_output). Never raises.
+_LOG = logging.getLogger(__name__)
+_NOTICES_SEEN: Dict[str, set] = {}  # session_id -> one-off notices already posted to that session
 
-    Appended, not prepended: Hermes' streaming CLI and chat apps only accept a transform that
-    keeps the streamed reply as a prefix; otherwise the reply is shown twice.
+
+def _post(text: str) -> bool:
+    """Post one chat notice, outside the model context. Never raises; False if it was not posted."""
+    try:
+        handle = _CTX.post_message(text)
+        if getattr(handle, "ok", False):
+            return True
+        _LOG.debug("cacheguard: notice not posted: %s", getattr(handle, "error", None))
+    except Exception as exc:
+        _LOG.debug("cacheguard: notice not posted: %s: %s", type(exc).__name__, exc)
+    return False
+
+
+def _post_notices(sid: str) -> None:
+    """Post each one-off notice this session has not had yet."""
+    seen = _NOTICES_SEEN.get(sid)
+    if seen is None:
+        if len(_NOTICES_SEEN) >= _PENDING_MAX:
+            _NOTICES_SEEN.pop(next(iter(_NOTICES_SEEN)))
+        seen = _NOTICES_SEEN[sid] = set()
+    for reason in list(_H["pending_notices"]):
+        if reason not in seen and _post(f"{_POST_PREFIX} {reason}"):
+            seen.add(reason)
+
+
+def _transform_llm_output(**kwargs: Any) -> Any:
+    """Post the pending note as a chat notice (Hermes transform_llm_output). Never raises.
+
+    The reply is never changed (None): one-off notices go first, then this turn's result line.
+    Without ctx.post_message, or if a post fails, nothing is shown.
     """
     try:
         if _is_unattended(kwargs):
             return None
-        text = kwargs.get("response_text")
         sid = kwargs.get("session_id")
         turn = kwargs.get("turn_id")
+        if isinstance(sid, str) and sid:
+            _post_notices(sid)
         owner = _PENDING_TURN.get(sid)
         if owner and isinstance(turn, str) and turn and owner != turn:
             return None  # another turn of this session (/btw, background review): not its note
         note = _PENDING.pop(sid, None)
         _PENDING_TURN.pop(sid, None)
-        if note and isinstance(text, str) and text:
-            return _without_old_lines(text) + "\n\n" + note
+        if note:
+            _post(note)
     except Exception:
         pass
     return None
@@ -1219,6 +1184,72 @@ def _clean_history(items: List[Any]) -> List[Any]:
     return out
 
 
+def _plain_for_hash(value: Any) -> Any:
+    """A message as the provider's cache sees it: `cache_control` markers move from call to call
+    (and turn a string into a one-part list), and so do Bedrock's `cachePoint` blocks, so they
+    are left out."""
+    if isinstance(value, dict):
+        out = {k: _plain_for_hash(v) for k, v in value.items() if k != "cache_control"}
+        content = out.get("content")
+        if (isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict)
+                and content[0].get("type") in _TEXT_PART_TYPES and set(content[0]) <= {"type", "text"}
+                and isinstance(content[0].get("text"), str)):
+            out["content"] = content[0]["text"]
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_plain_for_hash(v) for v in value
+                if not (isinstance(v, dict) and set(v) == {"cachePoint"})]
+    return value
+
+
+def _hash_messages(items: List[Any], n: int) -> Tuple[str, str]:
+    """(hash of the first n messages, hash of all of them), in one pass. Raises on anything
+    that is not plain JSON data: callers treat that as "no hash"."""
+    whole = hashlib.sha256()
+    head = whole.hexdigest() if n <= 0 else ""
+    for i, item in enumerate(items):
+        line = json.dumps(_plain_for_hash(item), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        whole.update(line.encode("utf-8", "surrogatepass") + b"\n")
+        if i + 1 == n:
+            head = whole.copy().hexdigest()
+    return head, whole.hexdigest()
+
+
+# session_id -> (api_request_id, message count, hash, prefix changed?) of the call being sent;
+# saved to the session file once the call is answered (see _record_response)
+_PREFIX_PENDING: Dict[str, Tuple[str, int, str, bool]] = {}
+_PREFIX_PENDING_MAX = 64
+
+
+def _note_prefix(kwargs: Dict[str, Any], clean: List[Any]) -> None:
+    """Compare the start of this call's cleaned messages with the last answered call of the same chat."""
+    sid = kwargs.get("session_id")
+    if not isinstance(sid, str) or not sid:
+        return
+    payload = {**kwargs, "task_id": sid} if _is_minted_main_call(kwargs) else kwargs
+    if _is_auxiliary(payload):
+        return  # background calls neither read nor move the chat's hash
+    rec = _get_session(sid)
+    count, old = rec.get("prefix_n"), rec.get("prefix_hash")
+    known = isinstance(count, int) and not isinstance(count, bool) and count > 0 and isinstance(old, str)
+    head, whole = _hash_messages(clean, count if known else 0)
+    changed = bool(known and (len(clean) < count or head != old))
+    if sid not in _PREFIX_PENDING and len(_PREFIX_PENDING) >= _PREFIX_PENDING_MAX:
+        _PREFIX_PENDING.pop(next(iter(_PREFIX_PENDING)))
+    _PREFIX_PENDING[sid] = (str(kwargs.get("api_request_id") or ""), len(clean), whole, changed)
+
+
+def _take_prefix(sid: str, api_request_id: str) -> Optional[Tuple[int, str, bool]]:
+    """The (count, hash, changed) noted for this call, or None. Never raises."""
+    try:
+        pending = _PREFIX_PENDING.pop(sid, None)
+        if pending is not None and pending[0] == api_request_id:
+            return pending[1], pending[2], pending[3]
+    except Exception:
+        pass
+    return None
+
+
 def _on_llm_request(**kwargs: Any) -> Any:
     """Keep cacheguard's own lines in the chat but out of what the model receives. Never raises."""
     try:
@@ -1231,6 +1262,10 @@ def _on_llm_request(**kwargs: Any) -> Any:
             items = request.get(key)
             if isinstance(items, list):
                 clean = _clean_history(items)
+                try:
+                    _note_prefix(kwargs, clean)
+                except Exception:
+                    pass  # no hash: the call is judged as before
                 if len(clean) != len(items) or any(a is not b for a, b in zip(clean, items)):
                     return {"request": {**request, key: clean}, "source": "cacheguard",
                             "reason": "removed cacheguard lines"}
@@ -1270,12 +1305,17 @@ def _gateway_confirmation(payload: Dict[str, Any], command: str, deny_text: str,
             })
             if not isinstance(decision, dict) or not ("resolved" in decision or decision.get("notify_failed")):
                 raise ValueError("unexpected box answer")  # Hermes changed shape: a box failure, not a Cancel
-            if decision.get("resolved") and decision.get("choice") in ("once", "session", "always"):
-                return None
+            resolved, choice = decision.get("resolved"), decision.get("choice")
             if decision.get("notify_failed"):
                 outcome = "undelivered"
+            elif resolved is True and choice in ("once", "session", "always"):
+                return None
+            elif resolved is True and choice in ("deny", None):  # None: prompt withdrawn, nobody answered
+                outcome = "cancelled"
+            elif resolved is False and choice is None:
+                outcome = "timeout"
             else:
-                outcome = "cancelled" if decision.get("resolved") or decision.get("choice") else "timeout"
+                raise ValueError("unknown box answer value")  # Hermes changed a value: a box failure
         except Exception as exc:
             _box_broke(exc)  # the box failed: send, and stop asking until restart
             return None
@@ -1339,37 +1379,6 @@ def _act(kwargs: Dict[str, Any], is_cli: bool, mode: Any,
     return None
 
 
-def _last_model(session_id: str) -> Optional[str]:
-    """Provider/model used by the session's last main-loop call.
-
-    Per-session state (written at middleware return) first; for sessions the plugin never
-    saw, Hermes' own per-session usage table (state.db, session_model_usage).
-    """
-    prev = _get_session(session_id).get("model")
-    if isinstance(prev, str) and prev:
-        return prev
-    if not session_id or not _healthy("state_db"):
-        return None
-    try:
-        import sqlite3
-
-        from hermes_constants import get_hermes_home
-
-        con = sqlite3.connect(_state_db_uri(get_hermes_home()), uri=True, timeout=1.0)
-        try:
-            row = con.execute(
-                "SELECT billing_provider, model FROM session_model_usage "
-                "WHERE session_id = ? AND task = '' AND model != 'unknown' "
-                "ORDER BY last_seen DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-        finally:
-            con.close()
-        return _model_key(row[0], row[1]) if row else None
-    except Exception:
-        return None
-
-
 def _domain_key(payload: Dict[str, Any]) -> str:
     return json.dumps([_model_key(payload.get("provider"), payload.get("model")),
                        payload.get("api_mode") or "unknown"])
@@ -1392,20 +1401,20 @@ def _remember_send(payload: Dict[str, Any], sent_at: float) -> None:
 
 def _cooldown_active(rec: Dict[str, Any], payload: Dict[str, Any], cfg: Dict[str, Any], now: float) -> bool:
     sent_at = _guard_sends(rec).get(_domain_key(payload))
-    return _finite_number(sent_at) and 0 <= now - sent_at < float(cfg["min_gap_seconds"])  # future time: clock went back
+    return _finite_number(sent_at) and 0 <= now - sent_at < _pause_seconds(cfg["pause_m"])  # future time: clock went back
 
 
 def _evaluate_model_change(kwargs: Dict[str, Any], cfg: Dict[str, Any], surface_mode: Any = None) -> Optional[Tuple[int, str, str]]:
     """Return (size, previous_model, model) when the session's model/provider changed."""
     surface_mode = surface_mode if surface_mode is not None else _surface_mode(kwargs, cfg)
-    if not cfg["enabled"] or surface_mode == "off" or _model_change_mode(cfg, surface_mode) not in ("warn", "block"):
+    if surface_mode not in ("warn", "block"):
         return None
     if int(kwargs.get("api_call_count") or 0) != 1:
         return None
     session_id = kwargs.get("session_id") or ""
     model = _model_key(kwargs.get("provider"), kwargs.get("model"))
-    prev = _last_model(session_id)
     rec = _get_session(session_id)
+    prev = rec.get("model") if isinstance(rec.get("model"), str) else None
     mode_changed = (isinstance(rec.get("api_mode"), str) and kwargs.get("api_mode")
                     and rec["api_mode"] != kwargs["api_mode"])
     if not prev or (prev == model and not mode_changed):
@@ -1415,7 +1424,7 @@ def _evaluate_model_change(kwargs: Dict[str, Any], cfg: Dict[str, Any], surface_
     if mode_changed:
         prev = f"{prev} ({rec['api_mode']} → {kwargs['api_mode']})"
     size = score_risk(rec, {"request": kwargs.get("request")})["tokens_at_risk"]
-    if size < int(cfg["min_context_tokens"]):
+    if size < _size_tokens(cfg["size_k"]):
         return None
     return size, prev, model
 
@@ -1424,8 +1433,6 @@ def _evaluate(kwargs: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None, surf
     """Return (size, model, gap_s) when the trigger fires, else None."""
     cfg = cfg or _cfg()
     surface_mode = surface_mode if surface_mode is not None else _surface_mode(kwargs, cfg)
-    if not cfg["enabled"]:
-        return None
     # Only the first call of a turn: the read that pays the cold context.
     if int(kwargs.get("api_call_count") or 0) != 1:
         return None
@@ -1441,8 +1448,6 @@ def _evaluate(kwargs: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None, surf
         return None
     risk = score_risk(rec, {
         "request": kwargs.get("request"), "now": now, "settings": cfg,
-        "fallback_last_assistant_ts": _last_assistant_ts(session_id)
-            if not _finite_number(rec.get("last_api_ts")) or rec["last_api_ts"] > now else None,
     })
     factors = risk["factors"]
     if not factors["window_crossed"] or not factors["floor_crossed"]:
@@ -1465,43 +1470,24 @@ def _pause_text(gap_s: float) -> str:
     return f"{count} {unit}{'' if count == 1 else 's'}"
 
 
-def _pause_phrase(gap_s: float) -> str:
-    """`a 12-minute pause`, `an 8-hour pause`."""
-    count, _, unit = _pause_text(gap_s).partition(" ")
-    n = int(count)
-    article = "an" if n in (8, 11, 18) or 80 <= n <= 89 or 800 <= n <= 899 else "a"
-    return f"{article} {n}-{unit.rstrip('s')} pause"
-
-
-_USING_PREFIX = "using "
-
-
-def _using_line(model_key: str) -> str:
-    """`using openrouter deepseek-v4.1-flash` from a provider/model key."""
-    provider, _, rest = model_key.partition("/")
-    return f"{_USING_PREFIX}{provider} {rest.rsplit('/', 1)[-1]}"
-
-
-def _cache_cost_text(size: int, gap_s: float, using: Optional[str] = None,
-                     cold_percent: Optional[int] = None) -> str:
-    """The confirm box text. cold_percent: past rate of lost caches after this pause, if known."""
+def _cache_cost_text(size: int, gap_s: float, cold: Optional[Tuple[int, int]] = None) -> str:
+    """The confirm box text. cold: (lost, calls) of past calls after this pause, if known."""
     return (f"{_PREFIX} Possible cache cost\n\n"
-            f"Paused {_pause_text(gap_s)} · ~{size:,} tokens may reload"
-            + (f" · chance of loss {cold_percent}%" if cold_percent is not None else "")
-            + (f"\n{using}" if using else ""))
+            f"Paused {_pause_text(gap_s)} · ~{size:,} tokens may be rebilled"
+            + (f" · lost {cold[0]} of {cold[1]} similar pauses" if cold is not None else ""))
 
 
-def _cold_chance(model: str, gap_s: float) -> Optional[int]:
-    """Percent of past calls of this model that found a cold cache after a similar pause.
+def _cold_counts(model: str, gap_s: float) -> Optional[Tuple[int, int]]:
+    """(lost, calls): past calls of this model that found a cold cache after a similar pause.
 
     None until the matching pause bucket holds _MIN_CHANCE_CALLS measurements.
     """
     try:
         rows = _load_observations()
-        cells = _cold_cells(rows, evaluate_observations(rows))[False].get(model)
+        cells = _cold_cells(rows, evaluate_observations(rows)).get(model)
         cell = cells[_bucket_index(float(gap_s), _GAP_EDGES)] if cells else None
         if cell and cell["calls"] >= _MIN_CHANCE_CALLS:
-            return round(100 * cell["cold"] / cell["calls"])
+            return cell["cold"], cell["calls"]
     except Exception:
         pass
     return None
@@ -1568,7 +1554,7 @@ def _confirmation_screen(kwargs: Dict[str, Any], command: str, deny_text: str, m
 
 
 _NOT_SENT_TEXT = _PREFIX + " BLOCKED · message not sent"
-_BOX_OFF_TEXT = ("the Send/Cancel box failed, so messages now go out with a warning "
+_BOX_OFF_TEXT = ("the cacheguard box failed, so messages now go out with a warning "
                  "until Hermes restarts. Details: /cacheguard")
 
 
@@ -1590,15 +1576,11 @@ def _denied_response(model: str, deny_text: Any, outcome: str, api_mode: Any) ->
         return None
 
 
-# Typed answers for our own two buttons (Hermes' reader does not know them).
-_BOX_ALIASES = {"send": "once", "2": "deny"}
-
-
 def _box_answer(owner: Any, answer: Any, choices: Any) -> str:
     """Map the box answer to once, deny, timeout or unknown. Only once sends.
 
-    Typed answers work: "send" and "1" send, "2" cancels, Hermes' own aliases (y, no, ...)
-    are read by its helper. Without the helper, only the exact choice ids count. An answer
+    Typed answers are read by Hermes' own helper against the two choices the box shows
+    (Send message, Cancel). Without the helper, only the exact choice ids count. An answer
     nobody can read is typed text, not a Send: it prints one plain line and the message is not
     sent. An answer that is not text at all means the box changed shape: it raises, the caller
     treats it as a box failure (message sent, box off).
@@ -1607,8 +1589,6 @@ def _box_answer(owner: Any, answer: Any, choices: Any) -> str:
         return "timeout"
     if not isinstance(answer, str):
         raise ValueError("unexpected box answer")  # not text at all: a box failure, not a human answer
-    if isinstance(answer, str):
-        answer = _BOX_ALIASES.get(answer.strip().lower(), answer)
     normalized = answer if answer in ("once", "deny") else None  # exact match, no helper needed
     normalize = getattr(owner, "_normalize_slash_confirm_choice", None)
     if callable(normalize) and isinstance(answer, str):
@@ -1621,7 +1601,7 @@ def _box_answer(owner: Any, answer: Any, choices: Any) -> str:
         return "once"
     if normalized in ("deny", "cancel"):
         return "deny"
-    _notice("unreadable answer in the Send/Cancel box: message not sent")
+    _notice("unreadable answer in the cacheguard box: message not sent")
     return "unknown"
 
 
@@ -1645,11 +1625,10 @@ def _denied(deny_text: Any, outcome: str) -> str:
 
 
 def _deny_text(session_id: Optional[str] = None, gateway: bool = False, gap_s: Optional[float] = None,
-               outcome: str = "cancelled", timeout: Optional[int] = None, cause: Optional[str] = None,
-               estimate: Optional[int] = None, using: Optional[str] = None) -> str:
+               outcome: str = "cancelled", timeout: Optional[int] = None, cause: Optional[str] = None) -> str:
     text = _PREFIX + " BLOCKED · message not sent"
     if _finite_number(gap_s):
-        text += f" after {_pause_phrase(gap_s)}"
+        text += f" after a pause of {_pause_text(gap_s)}"
     if outcome == "timeout" and timeout is not None:
         text += (" and " if _finite_number(gap_s) else " after ") + f"{timeout}s timeout"
     elif outcome == "undelivered":
@@ -1658,11 +1637,7 @@ def _deny_text(session_id: Optional[str] = None, gateway: bool = False, gap_s: O
         text += " (cancelled)"
     elif cause:
         text += f" ({cause})"
-    if estimate is not None:
-        text += f" · chance of loss {estimate}%"
-    if using:
-        text += f"\n\n{using}"
-    text += "\n\nSend it again, or start /new and paste it."
+    text += "\nSend it again, or start /new and paste it."
     if session_id:
         text += " Session ID: " + json.dumps(str(session_id), ensure_ascii=False)[1:-1]  # one line, whatever the id
     return text
@@ -1720,44 +1695,6 @@ class _SyntheticResponse:
             self.choices = [_SyntheticChoice(_SyntheticMessage(content))]
 
 
-def _print_line(text: str) -> None:
-    # Bare print() is swallowed by the CLI's prompt_toolkit renderer
-    # (patch_stdout), so the warning never reaches the screen. Prefer the CLI's
-    # agent-status printer: it HOLDS the line while a reply box is streaming and
-    # prints it after the box footer, so it never lands mid-reply. Then the
-    # plain internal helper; then print (gateway, -q, tests).
-    try:
-        cli = getattr(getattr(_CTX, "_manager", None), "_cli_ref", None)
-        status_print = getattr(cli, "_agent_status_print", None)
-        if callable(status_print):
-            status_print(text)
-            return
-    except Exception:
-        pass
-    try:
-        # Only a CLI that is already running: importing cli in a gateway would load all of it.
-        visible = getattr(sys.modules.get("cli"), "_cli_visible_print", None)
-        if callable(visible):
-            visible(text)
-            return
-    except Exception:
-        pass
-    try:
-        print(text, flush=True)
-    except Exception:
-        pass
-
-
-def _fmt_gap(seconds: float) -> str:
-    if seconds < 90:
-        return f"{int(seconds)}s"
-    if seconds < 5400:
-        return f"{int(seconds // 60)}min"
-    if seconds < 48 * 3600:
-        return f"{seconds / 3600:.1f}h"
-    return f"{seconds / 86400:.0f}d"
-
-
 # --------------------------------------------------------------------------- #
 # middleware return: learn from real usage
 # --------------------------------------------------------------------------- #
@@ -1780,10 +1717,13 @@ def _record_response(payload: Dict[str, Any], response: Any,
         "api_request_id": str(payload.get("api_request_id") or ""),
         "prompt_tokens": prompt, "cache_read_tokens": cached, "cache_write_tokens": written,
     }
+    auxiliary = _is_auxiliary(payload)
+    prefix = None if auxiliary else _take_prefix(sid, attempt["api_request_id"])
+    if prefix is not None:
+        attempt["prefix_changed"] = prefix[2]
     with _storage_lock():
         rows, truncated = _read_recent_observations()  # the newest rows: enough for this call
-        rec = _read_session(sid, rows)
-        auxiliary = _is_auxiliary(payload)
+        rec = _read_session(sid)
         if auxiliary:
             row = detect_observation({"session": {}, "observations": []}, attempt)
             row["cause"] = "auxiliary"
@@ -1796,11 +1736,13 @@ def _record_response(payload: Dict[str, Any], response: Any,
         if isinstance(task_id, str) and task_id:
             row["task_id"] = task_id
         _write_observation(row)
-        _maybe_trim_observations(_cfg()["max_observations"])
+        _maybe_trim_observations(_MAX_OBSERVATIONS)
         if not auxiliary:
             updated = dict(rec, last_api_ts=response_ts, model=attempt["model"], api_mode=attempt["api_mode"])
             if prompt is not None:
                 updated["prompt_tokens"] = prompt
+            if prefix is not None:
+                updated["prefix_n"], updated["prefix_hash"] = prefix[0], prefix[1]
             _write_json_atomic(_session_file(sid), updated)
         elif (attempt["model"] == rec.get("model") and attempt["api_mode"] == rec.get("api_mode")
               and _finite_number(rec.get("prompt_tokens")) and rec["prompt_tokens"] > 0
@@ -1829,19 +1771,16 @@ _CTX: Any = None  # plugin context, kept for /cacheguard set (ctx.set_config)
 _SET_USAGE = (
     "usage: /cacheguard set <name> <value>\n"
     "  cli           off | warn | block   terminal, editor\n"
-    "  desktop       off | warn | block   desktop app, web UI (unset = cli)\n"
-    "  gateway       off | warn | block   Telegram and other chat apps\n"
-    "  model_change  off | warn | block   model or provider changes\n"
-    "  minutes       number >= 1       alert after this many minutes of pause\n"
-    "  tokens        number (in k)     alert from this prompt size, e.g. 30 = 30k\n"
-    "  show_model    on | off          name the model in the confirm box and result line\n"
-    "  display_on_success  on | off    show the result line when the cache was kept (default off)\n"
-    "  max_observations  number >= 1000  history rows kept (default 10000)"
+    "  desktop       off | warn | block   desktop app, web UI\n"
+    "  gateway       off | warn | block   Telegram and other messaging platforms\n"
+    "  pause_m       number >= 1       alert after this many minutes of pause\n"
+    "  size_k        number (in k)     alert from this prompt size, e.g. 30 = 30k (max 2000)\n"
+    "  display_on_success  on | off    show the result line when the cache was kept (default off)"
 )
 
 
 _SETUP_USAGE = (
-    "usage: /cacheguard setup <all|cli|desktop|gateway> <off|warn|block> [pause minutes] [size in k tokens]\n"
+    "usage: /cacheguard setup <all|cli|desktop|gateway> <off|warn|block> [pause_m] [size_k]\n"
     "  /cacheguard setup all off                   cli, desktop and gateway: off (pause and size unchanged)\n"
     "  /cacheguard setup all block 10 30           cli, desktop and gateway: block\n"
     "  /cacheguard setup gateway warn 10 30        gateway: warn (even if it was off)\n"
@@ -1855,25 +1794,23 @@ _HELP_TEXT = (
     "  /cacheguard                          summary: how often the cache was lost\n"
     "  /cacheguard all                      every recorded model\n"
     "  /cacheguard <model>                  only models whose name contains this text\n"
-    "  /cacheguard setup <all|cli|desktop|gateway> <mode> [pause minutes] [size in k tokens]\n"
+    "  /cacheguard setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k]\n"
     "                                       one group, or all three. Pause and size apply to all groups:\n"
     "                                       give them together, or leave them out to keep the current values\n"
-    "                                       Claude keeps the cache about 5 min, but the default pause is 10: try minutes 4\n"
-    "  /cacheguard off                      same as setup all off: all three groups off, measuring continues\n"
     "  /cacheguard set <name> <value>\n"
     + "\n".join(_SET_USAGE.splitlines()[1:]) + "\n"
-    "  /cacheguard export <first> <last>    save this chat to a file (CLI only)\n"
+    "  /cacheguard export <first> <last>    save the first and last messages to a file (CLI only)\n"
     "  /cacheguard export all               save every message (CLI only)\n"
     "  /cacheguard debug                    recent raw records\n"
     "  /cacheguard reset                    delete saved history\n"
-    "  /cacheguard help                     this text (also /cacheguard ?)\n"
+    "  /cacheguard help                     this text\n"
     "\n"
     "Examples (copy and paste)\n"
     "  /cacheguard setup all off            cli, desktop and gateway: off (pause and size unchanged)\n"
     "  /cacheguard setup cli block 10 20    cli: block after a 10 minute pause, prompts of 20k+\n"
     "  /cacheguard setup gateway warn 10 30 gateway warns, even if it was off\n"
-    "  /cacheguard set gateway block        guard Telegram and other chat apps\n"
-    "  /cacheguard set model_change warn    warn when the model changes\n"
+    "  /cacheguard set gateway block        guard Telegram and other messaging platforms\n"
+    "  /cacheguard set pause_m 1            change only the pause, here 1 minute\n"
     "  /cacheguard export 5 5               save the first and last 5 messages (CLI only)"
 )
 
@@ -1881,43 +1818,26 @@ _HELP_TEXT = (
 def _parse_setting(name: str, raw: str) -> Tuple[Optional[Tuple[str, Any, str]], str]:
     """Validate one `name value` pair. Return ((config_key, value, shown), "") or (None, error)."""
     name, raw = name.lower(), raw.lower()
-    if name in ("cli", "desktop", "gateway", "model_change"):
+    if name in ("cli", "desktop", "gateway"):
         allowed = ("off", "warn", "block")
         if raw not in allowed:
             return None, f"cacheguard: {name} must be one of {', '.join(allowed)}."
         return (name, raw, raw), ""
-    if name == "show_model":
-        if raw not in ("on", "off"):
-            return None, "cacheguard: show_model must be on or off."
-        return (name, raw == "on", raw), ""
     if name == "display_on_success":
         if raw not in ("on", "off"):
             return None, "cacheguard: display_on_success must be on or off."
         return (name, raw == "on", raw), ""
-    if name == "max_observations":
-        if not raw.isdecimal() or int(raw) < 1000:
-            return None, "cacheguard: max_observations must be a whole number >= 1000."
-        return (name, int(raw), f"{int(raw)} rows"), ""
-    if name in ("minutes", "tokens"):
+    if name in ("pause_m", "size_k"):
         try:
             number = float(raw)
         except ValueError:
-            number = -1.0
-        if not math.isfinite(number) or number < 0:
-            if not math.isfinite(number):
-                return None, f"cacheguard: {name} must be a finite number."
-            return None, f"cacheguard: {name} must be a number >= {1 if name == 'minutes' else 0}."
-        scale = 60 if name == "minutes" else 1000
-        scaled = number * scale
-        if not math.isfinite(scaled):
-            return None, f"cacheguard: {name} is too large."
-        if name == "tokens" and number > 2000:
-            return None, "cacheguard: tokens is in thousands: 20 = 20k. Max 2000."
-        if name == "minutes":
-            if scaled < 60:
-                return None, "cacheguard: minutes must be a number >= 1."
-            return ("min_gap_seconds", int(scaled), f"{number:g} min"), ""
-        return ("min_context_tokens", int(scaled), f"{number:g}k tokens"), ""
+            number = math.nan
+        if not _valid_number(name, number):
+            if name == "pause_m":
+                return None, "cacheguard: pause_m must be a number >= 1."
+            return None, "cacheguard: size_k is in thousands: 20 = 20k. A number from 0 to 2000."
+        saved = int(number) if number.is_integer() else number
+        return (name, saved, f"{number:g} min" if name == "pause_m" else f"{number:g}k"), ""
     return None, ""
 
 
@@ -1957,7 +1877,7 @@ def _cmd_set(args: List[str]) -> str:
 
 
 def _cmd_setup(args: List[str]) -> str:
-    """/cacheguard setup <all|cli|desktop|gateway> <mode> [minutes] [tokens-in-k]: the main settings at once.
+    """/cacheguard setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k]: the main settings at once.
 
     all: all three groups get the mode. One group: only that group.
     Minutes and tokens are global and optional: give both or neither. Omitted = left unchanged.
@@ -1976,13 +1896,13 @@ def _cmd_setup(args: List[str]) -> str:
     items = [(g, _parse_setting(g, mode_raw)[0]) for g in groups]
     with_timing = len(args) == 4
     if with_timing:
-        minutes_item, err = _parse_setting("minutes", args[2])
-        if minutes_item is None:
+        pause_item, err = _parse_setting("pause_m", args[2])
+        if pause_item is None:
             return err + "\n" + _SETUP_USAGE
-        tokens_item, err = _parse_setting("tokens", args[3])
-        if tokens_item is None:
+        size_item, err = _parse_setting("size_k", args[3])
+        if size_item is None:
             return err + "\n" + _SETUP_USAGE
-        items += [("minutes", minutes_item), ("tokens", tokens_item)]
+        items += [("pause_m", pause_item), ("size_k", size_item)]
     for name, (key, value, _shown) in items:
         try:
             _save_setting(key, value)
@@ -1992,7 +1912,7 @@ def _cmd_setup(args: List[str]) -> str:
     if not with_timing:
         return f"cacheguard: {modes} (saved to config)."
     shown = {name: parsed[2] for name, parsed in items}
-    return (f"cacheguard: {modes} · pause ≥ {shown['minutes']} · size ≥ {shown['tokens'].replace(' tokens', '')} "
+    return (f"cacheguard: {modes} · pause ≥ {shown['pause_m']} · size ≥ {shown['size_k']} "
             "(pause and size apply to all groups; saved to config).")
 
 
@@ -2116,10 +2036,8 @@ def _cmd_debug(args: List[str]) -> str:
     sessions: Dict[str, List[Dict[str, Any]]] = {}
     raw_rows = _load_observations()
     measured = evaluate_observations(raw_rows)
-    for source, result in zip(raw_rows, measured):
+    for result in measured:
         r = dict(result)
-        if r["approximate"]:
-            r["legacy_cold"] = source.get("cold")
         sessions.setdefault(str(r.get("session_id") or "?"), []).append(r)
     recent = sorted(sessions.items(), key=lambda kv: (
         kv[1][-1].get("ts") if _finite_number(kv[1][-1].get("ts")) else 0
@@ -2140,11 +2058,7 @@ def _cmd_debug(args: List[str]) -> str:
             flags = []
             if prev_model and r.get("model") != prev_model:
                 flags.append(f"MODEL CHANGE from {prev_model}")
-            if r["approximate"]:
-                flags.append("APPROXIMATE")
-                if r.get("legacy_cold") is True:
-                    flags.append("LEGACY COLD")
-            elif r["evaluable"]:
+            if r["evaluable"]:
                 flags.append("COLD" if r["cold"] else "OK")
             else:
                 flags.append("NON-EVALUABLE")
@@ -2153,7 +2067,7 @@ def _cmd_debug(args: List[str]) -> str:
                     if _finite_number(r.get("ts")) else "unknown-time")
             prompt_label = f"{prompt // 1000:>4d}k" if prompt is not None else "    ?"
             out.append(
-                f"  {when}  gap {_fmt_gap(gap) if gap is not None else 'first':>6s}  "
+                f"  {when}  gap {_pause_text(gap) if gap is not None else 'first':>10s}  "
                 f"{prompt_label}  cached {cached_label:>4s}  "
                 f"{str(r.get('model') or 'unknown')}  {' '.join(flags)}".rstrip()
             )
@@ -2187,9 +2101,11 @@ def _unknown_argument(word: str) -> str:
     return f"unknown argument '{word}'. Try /cacheguard help"
 
 
-def _cmd_show(raw_args: str = "") -> str:
+def _cmd_show(raw_args: str = "", terminal: bool = False) -> str:
+    """The /cacheguard command. terminal=True: `hermes cacheguard` (no chat): the summary names
+    the terminal command."""
     parts = (raw_args or "").split()
-    if parts and parts[0].lower() in ("help", "?"):
+    if parts and parts[0].lower() == "help":
         return _HELP_TEXT if len(parts) == 1 else _unknown_argument(parts[1])
     if parts and parts[0].lower() == "debug":
         if len(parts) > 2 or (len(parts) == 2 and not parts[1].isdecimal()):
@@ -2199,18 +2115,11 @@ def _cmd_show(raw_args: str = "") -> str:
         return _cmd_set(parts[1:])
     if parts and parts[0].lower() == "setup":
         return _cmd_setup(parts[1:])
-    if parts and parts[0].lower() == "off":  # same as `setup all off`
-        if len(parts) > 1:
-            return "usage: /cacheguard off"
-        return _cmd_setup(["all", "off"]) + (
-            "\nTo report again: /cacheguard setup all warn"
-            "\nThen, if you do not want reports in chat apps: /cacheguard set gateway off"
-            "\n(This picks new modes. It does not restore the old ones.)")
     if parts and parts[0].lower() == "export":
         return _cmd_export(parts[1:])
-    if parts and parts[0].lower() in ("reset", "clear"):
+    if parts and parts[0].lower() == "reset":
         if len(parts) > 1:
-            return f"usage: /cacheguard {parts[0].lower()}"
+            return "usage: /cacheguard reset"
         try:
             import shutil
 
@@ -2237,12 +2146,9 @@ def _cmd_show(raw_args: str = "") -> str:
     evaluated = evaluate_observations(rows)
     labels = _GAP_LABELS
 
-    minutes = f"{cfg['min_gap_seconds'] / 60:g}"
-    kilo = f"{cfg['min_context_tokens'] / 1000:g}"
-    groups = _cold_cells(rows, evaluated, model_filter)
-
-    # Old rows (pre-schema) stay on disk but are not shown: their verdicts used the old rule.
-    models = groups[False]
+    minutes = f"{cfg['pause_m']:g}"
+    kilo = f"{cfg['size_k']:g}"
+    models = _cold_cells(rows, evaluated, model_filter)
     selected = sorted(
         ((model, cells) for model, cells in models.items() if any(cell["calls"] for cell in cells)),
         key=lambda pair: (-sum(cell["calls"] for cell in pair[1]), pair[0]))
@@ -2251,13 +2157,15 @@ def _cmd_show(raw_args: str = "") -> str:
     # Same counts as the table cells below (cell "n" or the "/calls" denominator), for the shown rows.
     in_table = sum(cell["calls"] for _, cells in shown for cell in cells)
     pauses = f"{in_table:,} measured pause{'' if in_table == 1 else 's'}"
+    cmd = "hermes cacheguard" if terminal else "/cacheguard"
     lines = [
-        f"cacheguard  ·  cli {cfg['cli']}  ·  desktop {cfg['desktop'] or cfg['cli']}  ·  gateway {cfg['gateway']}"
-        f"  ·  pause {_fmt_gap(cfg['min_gap_seconds'])}"
-        f"  ·  size {int(cfg['min_context_tokens']) // 1000}k  ·  {pauses}",
+        f"cacheguard  ·  cli {cfg['cli']}  ·  desktop {cfg['desktop']}  ·  gateway {cfg['gateway']}"
+        f"  ·  pause {_pause_text(_pause_seconds(cfg['pause_m']))}"
+        f"  ·  size {cfg['size_k']:g}k  ·  {pauses}",
         "",
-        f"setup: /cacheguard setup all block {minutes} {kilo}  (cli, desktop and gateway: block after a {minutes} minute pause, size over {kilo}k tokens)",
-        "help: /cacheguard help",
+        f"setup: {cmd} setup all block {minutes} {kilo}  (cli, desktop and gateway: block after a {minutes} minute pause, size over {kilo}k tokens)",
+        f"set: {cmd} set pause_m 1  (change only the pause, here 1 minute)",
+        f"help: {cmd} help",
         "",
     ]
     if _health_text():  # nothing to say when all is well
@@ -2266,6 +2174,11 @@ def _cmd_show(raw_args: str = "") -> str:
     if models and 0 < measured < _MIN_TABLE_CALLS:
         lines.append(f"({measured} measurements so far, need at least {_MIN_TABLE_CALLS})")
         return "\n".join(lines)
+    try:
+        suggested = _suggested_pauses(evaluated, model_filter)
+    except Exception:
+        suggested = {}
+    labels = labels + ["suggested"]
     rendered_rows = []
     for model, cells in shown:
         values = []
@@ -2273,13 +2186,8 @@ def _cmd_show(raw_args: str = "") -> str:
             if not cell["calls"]:
                 values.append("—")
                 continue
-            if cell["calls"] < _MIN_CHANCE_CALLS:  # too few for a %: show cold/calls
-                values.append(f"{cell['cold']}/{cell['calls']}")
-                continue
-            percent = 100 * cell["cold"] / cell["calls"]
-            rate = ("<0.1" if 0 < percent < 0.05 else
-                    f"{percent:.1f}".rstrip("0").rstrip("."))
-            values.append(f"{rate}% ({cell['calls']})")
+            values.append(f"{cell['cold']}/{cell['calls']}")
+        values.append(suggested.get(model, "—"))
         rendered_rows.append((model, values))
     model_width = max([len("model")] + [len(model) for model, _ in rendered_rows])
     widths = [max([len(label)] + [len(values[i]) for _, values in rendered_rows])
@@ -2297,7 +2205,8 @@ def _cmd_show(raw_args: str = "") -> str:
     elif not selected:
         lines.append("(no usable pause observations yet; pauses under 1 min are not shown)")
     if len(shown) < len(selected):
-        lines.append(f"... {len(selected) - len(shown)} more models: /cacheguard all")
+        lines.append(f"... {len(selected) - len(shown)} more models: /cacheguard all"
+                     + (" (in a Hermes chat)" if terminal else ""))
     return "\n".join(lines)
 
 
@@ -2312,37 +2221,97 @@ _TOP_ROWS = 10
 # bit longer than the time the provider counts.
 _GAP_EDGES = [360.0, 1260.0, 2460.0, 3660.0, 5460.0, 7260.0]
 _GAP_LABELS = ["1-6m", "6-21m", "21-41m", "41-61m", "61-91m", "91-121m", ">2h01"]
-_MIN_CHANCE_CALLS = 10  # measurements in a pause bucket before a "% chance" is shown
+_MIN_CHANCE_CALLS = 10  # measurements in a pause bucket before the box shows lost/calls
 _MIN_TABLE_CALLS = 5  # measurements before the summary shows the cold-cache table
+_MIN_SUGGEST_CALLS = 20  # measurements of a model before the table suggests a pause for it
+_SUGGEST_LOSS = 0.10  # suggested pause: the longest one where at most this share of calls lost the cache
+
+
+def _measured_gap(row: Dict[str, Any]) -> Optional[float]:
+    """The pause of a call the table counts, None for a call it leaves out."""
+    gap = row.get("gap_s")
+    if not _finite_number(gap) or gap < 60 or _is_auxiliary(row) or not row["evaluable"]:
+        return None
+    return float(gap)
 
 
 def _cold_cells(rows: List[Dict[str, Any]], evaluated: List[Dict[str, Any]],
-                model_filter: str = "") -> Dict[bool, Dict[str, List[Dict[str, int]]]]:
-    """Calls and cold calls per model and pause bucket; keyed by `approximate` (historical)."""
-    groups: Dict[bool, Dict[str, List[Dict[str, int]]]] = {False: {}, True: {}}
-    for source, row in zip(rows, evaluated):
+                model_filter: str = "") -> Dict[str, List[Dict[str, int]]]:
+    """Calls and cold calls per model and pause bucket."""
+    models: Dict[str, List[Dict[str, int]]] = {}
+    for row in evaluated:
         model = str(row.get("model") or "unknown")
         if model_filter and model_filter not in model.lower():
             continue
-        models = groups[row["approximate"]]
         cells = models.setdefault(model, [{"calls": 0, "cold": 0} for _ in _GAP_LABELS])
-        gap = row.get("gap_s")
-        if not _finite_number(gap) or gap < 60 or _is_auxiliary(row):
+        gap = _measured_gap(row)
+        if gap is None:
             continue
-        # Preserve old classifications only for the historical report. They do
-        # not become exact verdicts or evidence for future guard decisions.
-        if row["approximate"]:
-            cold = source.get("cold")
-            if not isinstance(cold, bool):
-                continue
-        elif row["evaluable"]:
-            cold = bool(row["cold"])
-        else:
-            continue
-        cell = cells[_bucket_index(float(gap), _GAP_EDGES)]
+        cell = cells[_bucket_index(gap, _GAP_EDGES)]
         cell["calls"] += 1
-        cell["cold"] += int(cold)
-    return groups
+        cell["cold"] += int(bool(row["cold"]))
+    return models
+
+
+def _loss_blocks(points: List[Tuple[float, bool]]) -> List[Tuple[float, float, float, int]]:
+    """Isotonic fit (pool adjacent violators) of 'lost' on the pause: the loss share never falls
+    as the pause grows. Blocks of (first pause, last pause, loss share, calls)."""
+    by_gap: Dict[float, List[int]] = {}
+    for gap, lost in points:
+        count = by_gap.setdefault(gap, [0, 0])
+        count[0] += int(lost)
+        count[1] += 1
+    blocks: List[List[Any]] = []  # [first, last, lost, calls]
+    for gap in sorted(by_gap):
+        lost, calls = by_gap[gap]
+        blocks.append([gap, gap, lost, calls])
+        while len(blocks) > 1 and blocks[-2][2] * blocks[-1][3] > blocks[-1][2] * blocks[-2][3]:
+            top = blocks.pop()
+            blocks[-1][1], blocks[-1][2], blocks[-1][3] = top[1], blocks[-1][2] + top[2], blocks[-1][3] + top[3]
+    return [(b[0], b[1], b[2] / b[3], b[3]) for b in blocks]
+
+
+def _short_pause(seconds: float) -> str:
+    """5m, 16m, 1h, 1h20 (whole minutes, rounded down)."""
+    minutes = int(seconds // 60)
+    hours, minutes = divmod(minutes, 60)
+    if not hours:
+        return f"{minutes}m"
+    return f"{hours}h{minutes:02d}" if minutes else f"{hours}h"
+
+
+def _suggested_pause(points: List[Tuple[float, bool]]) -> str:
+    """The longest pause whose fitted loss share is _SUGGEST_LOSS or less; none when even the
+    shortest is above (a + after the pause: no block above, the longest pause seen);
+    — below _MIN_SUGGEST_CALLS measurements."""
+    if len(points) < _MIN_SUGGEST_CALLS:
+        return "—"
+    best = None
+    for _, last, share, _ in _loss_blocks(points):
+        if share > _SUGGEST_LOSS:
+            return "none" if best is None else _short_pause(best)
+        best = last
+    return _short_pause(best) + "+"  # no block above the limit: nothing lost beyond the longest pause seen
+
+
+def _suggested_pauses(evaluated: List[Dict[str, Any]], model_filter: str = "") -> Dict[str, str]:
+    """The `suggested` column per model. A model that fails to compute gets —."""
+    points: Dict[str, List[Tuple[float, bool]]] = {}
+    for row in evaluated:
+        try:
+            model = str(row.get("model") or "unknown")
+            gap = _measured_gap(row)
+            if gap is not None and not (model_filter and model_filter not in model.lower()):
+                points.setdefault(model, []).append((gap, bool(row["cold"])))
+        except Exception:
+            continue
+    out = {}
+    for model, model_points in points.items():
+        try:
+            out[model] = _suggested_pause(model_points)
+        except Exception:
+            out[model] = "—"
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -2351,6 +2320,7 @@ def _cold_cells(rows: List[Dict[str, Any]], evaluated: List[Dict[str, Any]],
 _H: Dict[str, Any] = {
     "checks": {}, "noticed": set(),
     "config_errors": set(), "data_errors": set(),
+    "pending_notices": [],  # one-off notices waiting to be posted to each session
 }
 
 
@@ -2361,14 +2331,12 @@ def _set_data_errors(errors: set) -> None:
 
 
 def _notice(reason: str) -> None:
-    """ONE '<prefix> <reason>' line per process per reason. `reason` is a plain sentence for the user."""
+    """ONE notice per process per reason, kept for transform_llm_output to post (once per session).
+    `reason` is a plain sentence for the user."""
     if reason in _H["noticed"]:
         return
     _H["noticed"].add(reason)
-    try:
-        _print_line(f"{_PREFIX} {reason}")
-    except Exception:
-        pass
+    _H["pending_notices"].append(reason)
 
 
 def _healthy(name: str) -> bool:
@@ -2450,6 +2418,135 @@ def _has_symbol(module: str, name: str) -> bool:
         return False
 
 
+# How the plugin calls each Hermes function, read from the installed Hermes (tested_hermes).
+# (module, name): (sync or async, positional names in order, names passed by keyword).
+# Only what the plugin passes is listed: a new optional argument with a default is harmless,
+# a new required argument, a renamed or moved one, a sync/async switch or a class is not.
+# Symbols not listed here (constants, calls Hermes makes itself) are only checked to exist.
+_CALLS: Dict[Tuple[str, str], Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = {
+    ("tools.terminal_tool", "_get_approval_callback"): ("sync", (), ()),
+    ("tools.approval", "_gateway_notify_cb"): ("sync", ("session_key",), ()),
+    ("tools.approval_gateway_wait", "_await_gateway_decision"):
+        ("sync", ("session_key", "notify_cb", "approval_data"), ()),
+    ("hermes_cli.cli_modal_mixin", "CLIModalMixin._normalize_slash_confirm_choice"):
+        ("sync", ("self", "raw", "choices"), ()),
+    ("agent.usage_pricing", "normalize_usage"): ("sync", ("response_usage",), ("provider", "api_mode")),
+    ("tools.approval_context", "get_current_session_key"): ("sync", (), ("default",)),
+    ("tools.skill_provenance", "get_current_write_origin"): ("sync", (), ()),
+    ("hermes_cli.config", "read_raw_config"): ("sync", (), ()),
+    ("hermes_cli.config", "read_raw_config_readonly"): ("sync", (), ()),  # newer Hermes only
+    ("hermes_constants", "get_hermes_home"): ("sync", (), ()),
+    ("gateway.session_context", "get_session_env"): ("sync", ("name", "default"), ()),
+    ("tools.bot_mode_probe", "is_bot_mode_managed"): ("sync", ("home",), ()),
+    ("tools.approval_context", "_is_single_query_approval_context"): ("sync", (), ()),
+    ("tools.approval_context", "_get_approval_timeout"): ("sync", (), ()),
+}
+_OPTIONAL = {("hermes_cli.config", "read_raw_config_readonly")}
+
+
+def _describe(module: str, name: str) -> Optional[Tuple[str, Optional[List[Tuple[str, str, bool]]]]]:
+    """(what it is, its parameters) for `name`, or None when it cannot be told.
+
+    what: "sync", "async", "class" or "variable". Parameters are (name, kind, has_default) with kind
+    posonly, pos, var_pos, kwonly or var_kw. A loaded module is asked directly (inspect), else the
+    source is parsed, never imported. An import or an alias we cannot judge gives None.
+    """
+    import ast
+    import inspect
+
+    mod = sys.modules.get(module)
+    if mod is not None:
+        obj: Any = mod
+        for part in name.split("."):
+            obj = getattr(obj, part)
+        if inspect.isclass(obj):
+            return "class", None
+        if not callable(obj):
+            return "variable", None
+        what = "async" if inspect.iscoroutinefunction(obj) else "sync"
+        try:
+            kinds = {inspect.Parameter.POSITIONAL_ONLY: "posonly", inspect.Parameter.POSITIONAL_OR_KEYWORD: "pos",
+                     inspect.Parameter.VAR_POSITIONAL: "var_pos", inspect.Parameter.KEYWORD_ONLY: "kwonly",
+                     inspect.Parameter.VAR_KEYWORD: "var_kw"}
+            params = [(p.name, kinds[p.kind], p.default is not inspect.Parameter.empty)
+                      for p in inspect.signature(obj).parameters.values()]
+        except (TypeError, ValueError):
+            return what, None
+        return what, params
+    try:
+        path = _module_file(module)
+    except Exception:
+        path = None  # cannot even find it: the existence check already says so
+    if path is None:
+        return None
+    body = ast.parse(path.read_text(errors="ignore")).body
+    *owners, last = name.split(".")
+    for owner in owners:
+        node = _binding(body, owner)
+        if not isinstance(node, ast.ClassDef):
+            return None
+        body = node.body
+    node = _binding(body, last)
+    if isinstance(node, ast.ClassDef):
+        return "class", None
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        literal = (ast.Constant, ast.List, ast.Dict, ast.Tuple, ast.Set)
+        return ("variable", None) if isinstance(node.value, literal) else None
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    a = node.args
+    positional = a.posonlyargs + a.args
+    firsts = len(positional) - len(a.defaults)
+    params = [(x.arg, "posonly" if i < len(a.posonlyargs) else "pos", i >= firsts) for i, x in enumerate(positional)]
+    if a.vararg:
+        params.append((a.vararg.arg, "var_pos", False))
+    params += [(x.arg, "kwonly", d is not None) for x, d in zip(a.kwonlyargs, a.kw_defaults)]
+    if a.kwarg:
+        params.append((a.kwarg.arg, "var_kw", False))
+    return ("async" if isinstance(node, ast.AsyncFunctionDef) else "sync"), params
+
+
+def _call_problem(module: str, name: str) -> str:
+    """"" when `name` still fits the way the plugin calls it (_CALLS), else a short plain reason.
+
+    Report only: the caller shows it in the health text. An error reading Hermes' code is
+    reported too, never raised.
+    """
+    short = name.split(".")[-1]
+    spec = _CALLS.get((module, name))
+    if spec is None:
+        return ""
+    try:
+        found = _describe(module, name)
+    except Exception as exc:
+        return f"cannot read `{short}`: {type(exc).__name__}"
+    if found is None:
+        return ""
+    want, pos, kw = spec
+    what, params = found
+    if what in ("class", "variable"):
+        return f"Hermes changed `{short}`: it is no longer a function"
+    if what != want:
+        return f"Hermes changed `{short}`: it is " + ("now async" if what == "async" else "no longer async")
+    if params is None:
+        return ""
+    positional = [p[0] for p in params if p[1] in ("posonly", "pos")]
+    var_pos = any(p[1] == "var_pos" for p in params)
+    var_kw = any(p[1] == "var_kw" for p in params)
+    if len(pos) > len(positional) and not var_pos:
+        return f"Hermes changed `{short}`: it no longer takes `{pos[len(positional)]}`"
+    if positional[:len(pos)] != list(pos[:len(positional)]):
+        return (f"Hermes changed `{short}`: its arguments are now ({', '.join(positional[:len(pos)])}), "
+                f"not ({', '.join(pos)})")
+    for k in kw:
+        if not var_kw and not any(p[0] == k and p[1] in ("pos", "kwonly") for p in params):
+            return f"Hermes changed `{short}`: it no longer takes `{k}`"
+    for pname, kind, has_default in params:
+        if kind in ("posonly", "pos", "kwonly") and not has_default and pname not in pos and pname not in kw:
+            return f"Hermes changed `{short}`: it now needs `{pname}`"
+    return ""
+
+
 def _tested_version() -> str:
     try:
         import re
@@ -2466,27 +2563,45 @@ def _health() -> Dict[str, Tuple[bool, str]]:
 
     def check(name: str, fn: Any) -> None:
         try:
-            out[name] = (True, "") if fn() else (False, "missing or changed")
+            result = fn()
+            if isinstance(result, str):  # a reason, already plain
+                out[name] = (False, result)
+            else:
+                out[name] = (True, "") if result else (False, "missing or changed")
         except Exception as exc:
             out[name] = (False, f"{type(exc).__name__}: {exc}")
 
-    check("approval_cb", lambda: _has_symbol("tools.terminal_tool", "_get_approval_callback"))
+    def has(*symbols: Tuple[str, str]) -> Any:
+        """True if every symbol exists and is still called the way we call it; False or a reason if not."""
+        for module, symbol in symbols:
+            if not _has_symbol(module, symbol):
+                if (module, symbol) in _OPTIONAL:
+                    continue
+                return False
+            problem = _call_problem(module, symbol)
+            if problem:
+                return problem
+        return True
+
+    check("approval_cb", lambda: has(("tools.terminal_tool", "_get_approval_callback")))
     # Only module-level symbols: the CLI's _prompt_text_input_modal, _approval_lock and _app live on
     # the running CLI object, which does not exist at register time. They fail open at call time.
-    check("gateway_approval", lambda: _has_symbol("tools.approval", "_gateway_notify_cb")
-          and _has_symbol("tools.approval_gateway_wait", "_await_gateway_decision"))
-    check("confirm_choice", lambda: _has_symbol("hermes_cli.cli_modal_mixin", "CLIModalMixin._normalize_slash_confirm_choice"))
-    check("usage_api", lambda: _has_symbol("agent.usage_pricing", "normalize_usage"))
-    check("session_key", lambda: _has_symbol("tools.approval_context", "get_current_session_key"))
-    check("write_origin", lambda: _has_symbol("tools.skill_provenance", "get_current_write_origin"))
-    check("request_middleware", lambda: _has_symbol("hermes_cli.middleware", "apply_llm_request_middleware"))
-    check("config_api", lambda: _has_symbol("hermes_cli.config", "read_raw_config")
-          and _has_symbol("hermes_constants", "get_hermes_home"))
-    check("session_env", lambda: _has_symbol("gateway.session_context", "get_session_env"))
-    check("bot_chat", lambda: _has_symbol("tools.bot_mode_probe", "BOT_CHAT_TITLE")
-          and _has_symbol("tools.bot_mode_probe", "is_bot_mode_managed"))
-    check("single_query", lambda: _has_symbol("tools.approval_context", "_is_single_query_approval_context"))
-    check("approval_timeout", lambda: _has_symbol("tools.approval_context", "_get_approval_timeout"))
+    check("gateway_approval", lambda: has(("tools.approval", "_gateway_notify_cb"),
+                                          ("tools.approval_gateway_wait", "_await_gateway_decision")))
+    check("confirm_choice", lambda: has(("hermes_cli.cli_modal_mixin", "CLIModalMixin._normalize_slash_confirm_choice")))
+    check("usage_api", lambda: has(("agent.usage_pricing", "normalize_usage")))
+    check("session_key", lambda: has(("tools.approval_context", "get_current_session_key")))
+    check("write_origin", lambda: has(("tools.skill_provenance", "get_current_write_origin")))
+    check("request_middleware", lambda: has(("hermes_cli.middleware", "apply_llm_request_middleware")))
+    check("config_api", lambda: has(("hermes_cli.config", "read_raw_config"),
+                                    ("hermes_cli.config", "read_raw_config_readonly"),
+                                    ("hermes_constants", "get_hermes_home")))
+    check("session_env", lambda: has(("gateway.session_context", "get_session_env")))
+    check("bot_chat", lambda: has(("tools.bot_mode_probe", "BOT_CHAT_TITLE"),
+                                  ("tools.bot_mode_probe", "is_bot_mode_managed")))
+    check("single_query", lambda: has(("tools.approval_context", "_is_single_query_approval_context")))
+    check("approval_timeout", lambda: has(("tools.approval_context", "_get_approval_timeout")))
+    check("post_message", lambda: callable(getattr(_CTX, "post_message", None)))
 
     def db(need: Dict[str, Any]) -> bool:
         import sqlite3
@@ -2506,10 +2621,8 @@ def _health() -> Dict[str, Tuple[bool, str]]:
             con.close()
         return True
 
-    check("state_db", lambda: db({"messages": {"session_id", "role", "timestamp"},
-                                  "session_model_usage": {"session_id", "billing_provider", "model", "task", "last_seen"}}))
+    check("state_db", lambda: db({"messages": {"session_id", "role", "content", "timestamp"}}))
     # Own check: only the Bot Chat title lookup and the chat-app export hint read `sessions`.
-    # Folding it into state_db would switch off the history fallback and model lookup too.
     check("sessions_db", lambda: db({"sessions": {"id", "title", "session_key", "started_at"}}))
 
     # Information only: a newer Hermes is not a fault. The checks above catch real breakage.
@@ -2530,16 +2643,19 @@ _HEALTH_EFFECTS = {
     "approval_cb": _NO_BOX_TEXT,
     "gateway_approval": _NO_BOX_TEXT,
     "state_db": "cacheguard cannot read the chat history: some features are off.",
-    "confirm_choice": "typed answers in the Send/Cancel box may not work: use the buttons.",
+    "confirm_choice": "typed answers in the cacheguard box may not work: use the buttons.",
     "usage_api": "cacheguard cannot read cache numbers: results may be missing.",
     "session_key": _NO_BOX_TEXT,
     "request_middleware": "cacheguard lines may be sent to the model.",
+    "llm_request": "cacheguard lines may reach the model.",
+    "transform_llm_output": "no result lines.",
     "write_origin": "cacheguard may count background calls as yours.",
     "session_env": "cacheguard may treat cron and kanban runs as chats.",
-    "sessions_db": "Bot Chat and export in chat apps may not find this chat.",
+    "sessions_db": "Bot Chat and export in the gateway may not find this chat.",
     "bot_chat": "cacheguard may treat Bot Chat as a normal chat.",
     "single_query": "with -Q and -z, cacheguard may ask where it should only warn.",
     "approval_timeout": "the box timeout may differ from Hermes.",
+    "post_message": "cacheguard cannot show its lines in this Hermes.",
     "middleware": "cacheguard is off: it could not start.",
 }
 
@@ -2557,7 +2673,7 @@ def _health_text() -> str:
     bad.extend(f"config: {reason}" for reason in sorted(_H.get("config_errors", set())))
     bad.extend(f"data: {reason}" for reason in sorted(_H.get("data_errors", set())))
     if _H.get("box_failed"):
-        bad.append("The Send/Cancel box failed this session, so it is off until Hermes restarts: "
+        bad.append("The cacheguard box failed this session, so it is off until Hermes restarts: "
                    f"block acts as warn. ({_H['box_failed']})")
     if not bad:
         return ""
@@ -2567,35 +2683,43 @@ def _health_text() -> str:
 # --------------------------------------------------------------------------- #
 # registration
 # --------------------------------------------------------------------------- #
-_CLI_HELP = "set up cacheguard from the terminal (no Hermes chat needed)"
+_CLI_HELP = "show or set up cacheguard from the terminal (no Hermes chat needed)"
 
 
 def _cli_setup_parser(parser) -> None:
-    """`hermes cacheguard setup|off`: arguments only; validation stays in _cmd_setup."""
-    parser.set_defaults(cache_guard_help=parser.print_help)
+    """`hermes cacheguard [setup|set|help]`: arguments only; validation stays in the chat functions."""
     actions = parser.add_subparsers(dest="cache_guard_action", metavar="<action>")
     setup = actions.add_parser("setup", help="set the mode of cli, desktop, gateway or all")
     setup.add_argument("group", help="all | cli | desktop | gateway")
     setup.add_argument("mode", help="off | warn | block")
-    setup.add_argument("minutes", nargs="?", help="optional: pause in minutes before the guard acts")
-    setup.add_argument("tokens", nargs="?", help="optional: size in k tokens (give both or neither)")
-    actions.add_parser("off", help="same as: setup all off")
+    setup.add_argument("minutes", nargs="?", metavar="pause_m", help="optional: pause in minutes before the guard acts")
+    setup.add_argument("tokens", nargs="?", metavar="size_k", help="optional: size in k tokens (give both or neither)")
+    change = actions.add_parser("set", help="change one setting, e.g. set pause_m 4")
+    change.add_argument("words", nargs="*", metavar="<name> <value>", help="name and value, as in /cacheguard set")
+    actions.add_parser("help", help="list the commands")
+
+
+_CLI_HELP_NOTE = ("\n\nIn the terminal, `hermes cacheguard` takes: (nothing) | help | setup | set.\n"
+                  "The other commands work inside a Hermes chat.")
 
 
 def _cli_handler(args) -> int:
-    """Print the same text as the in-chat command. Exit code 0 when settings were saved."""
+    """Print the same text as the in-chat command. Exit code 0 when it worked."""
     action = getattr(args, "cache_guard_action", None)
+    if action is None:  # the summary
+        print(_cmd_show("", terminal=True))
+        return 0
+    if action == "help":
+        print(_HELP_TEXT + _CLI_HELP_NOTE)
+        return 0
     if action == "setup":
         extra = [v for v in (args.minutes, args.tokens) if v is not None]
         text = _cmd_setup([args.group, args.mode, *extra])
-    elif action == "off":
-        text = _cmd_setup(["all", "off"])
-    else:
-        args.cache_guard_help()
-        return 0
-    text = text.replace("/cacheguard ", "hermes cacheguard ")  # usage lines name the terminal command
-    print(text)
-    return 0 if "saved to config" in text else 1
+    else:  # set
+        text = _cmd_set(args.words)
+    ok = "saved to config" in text
+    print(text.replace("/cacheguard ", "hermes cacheguard "))  # usage lines name the terminal command
+    return 0 if ok else 1
 
 
 def _register_cli(ctx: Any) -> None:
@@ -2604,7 +2728,7 @@ def _register_cli(ctx: Any) -> None:
     try:
         ctx.register_cli_command(
             name="cacheguard", help=_CLI_HELP, setup_fn=_cli_setup_parser, handler_fn=_cli_handler,
-            description="Set cacheguard modes without opening Hermes. Example: hermes -p NAME cacheguard setup all block 10 20",
+            description="Show or set cacheguard without opening Hermes. Example: hermes -p NAME cacheguard setup all block 10 20",
         )
     except Exception:
         pass
@@ -2625,18 +2749,18 @@ def register(ctx: Any) -> None:
         _notice(_HEALTH_EFFECTS["middleware"])
     try:
         ctx.register_middleware("llm_request", _on_llm_request)
-    except Exception:
-        pass
+    except Exception as exc:
+        _H["checks"]["llm_request"] = (False, f"{type(exc).__name__}: {exc}")
     try:
         ctx.register_hook("transform_llm_output", _transform_llm_output)
-    except Exception:
-        pass
+    except Exception as exc:
+        _H["checks"]["transform_llm_output"] = (False, f"{type(exc).__name__}: {exc}")
     try:
         ctx.register_command(
             "cacheguard",
             _cmd_entry,
             description="Show cacheguard status. 'setup' and 'set' change settings; 'reset' clears saved history.",
-            args_hint="[help | all | <model> | off | setup <all|cli|desktop|gateway> <mode> [minutes] [tokens-k] | set <name> <value> | export <first> <last> | export all | reset]",
+            args_hint="[help | all | <model> | setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k] | set <name> <value> | export <first> <last> | export all | reset]",
         )
     except Exception:
         pass

@@ -27,10 +27,14 @@ spec = importlib.util.spec_from_file_location("cache_guard_probe", plugin_path)
 plugin = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plugin)
 from agent.usage_pricing import normalize_usage
+from hermes_cli.plugins import PluginContext
+plugin._CTX = PluginContext  # no live context here: the class carries the same post_message
 u = normalize_usage({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 40}},
                     provider="p", api_mode="chat_completions")
 print(json.dumps({
     "health": {k: list(v) for k, v in plugin._health().items()},
+    "unshaped": [f"{m}.{n}" for (m, n) in plugin._CALLS
+                 if (m, n) not in plugin._OPTIONAL and plugin._describe(m, n) is None],
     "usage": [u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens],
 }))
 '''
@@ -56,4 +60,5 @@ def test_installed_hermes_has_what_the_plugin_needs(tmp_path):
     data = json.loads(result.stdout.strip().splitlines()[-1])
     bad = {k: v[1] for k, v in data["health"].items() if not v[0]}
     assert not bad, bad
+    assert not data["unshaped"], data["unshaped"]  # every expected signature was found and compared
     assert data["usage"] == [100, 40, 0]

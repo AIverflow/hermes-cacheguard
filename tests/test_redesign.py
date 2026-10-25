@@ -19,10 +19,10 @@ def test_cli_denial_preserves_request_and_has_no_observation(env):
 
 
 def test_history_keeps_early_evidence_past_twenty_thousand_rows(env):
+    from test_detector import exact_row
     p = env.plugin
-    first = {'ts': 1, 'session_id': 's', 'model': 'p/m', 'gap_s': 1,
-             'prompt_tokens': 1000, 'cache_read_tokens': 999}
-    other = dict(first, ts=2, model='p/other')
+    first = exact_row(ts=1, model='p/m')
+    other = exact_row(ts=2, model='p/other')
     p._obs_path().write_text(json.dumps(first) + '\n' + (json.dumps(other) + '\n') * 20000)
     rows = p._load_observations()
     assert len(rows) == 20001 and rows[0]['model'] == 'p/m'
@@ -114,29 +114,14 @@ def test_background_cache_read_restarts_guard_idle_clock(env, monkeypatch, cache
 
 def test_background_calls_never_show_main_guard(env, monkeypatch):
     install_normalizer(monkeypatch)
-    env.settings.update(cli='block', model_change='block')
+    env.settings.update(cli='block')
     seed_session(env, ago=3600, prompt_tokens=60000)
     before = env.plugin._get_session('s1')
     env.approval = lambda *a, **kw: pytest.fail('background requested human approval')
     send(env, {'prompt_tokens': 61000, 'cached': 0}, session_id='s1', task_id='security',
          model='other-model', request=big_request(), api_request_id='s1:security:turn:api:1')
     assert env.plugin._get_session('s1') == before
-    assert not env.printed
-
-
-def test_recovery_discards_historical_background_baseline_and_preserves_cooldown(env):
-    from test_detector import exact_row
-    p = env.plugin
-    main = exact_row(model='p/m', api_mode='chat_completions', ts=100, prompt_tokens=18731)
-    background = exact_row(model='p/m', api_mode='chat_completions', ts=110,
-                           api_request_id='s:review-task:turn:api:1', prompt_tokens=20944)
-    append_observation(p, main)
-    append_observation(p, background)
-    put_session(p, 's', {'last_api_ts':110, 'model':'p/m', 'api_mode':'chat_completions',
-                         'prompt_tokens':20944, 'guard_sends':{'main':90}})
-    recovered = p._get_session('s')
-    assert recovered['last_api_ts'] == 100 and recovered['prompt_tokens'] == 18731
-    assert recovered['guard_sends'] == {'main':90}
+    assert not env.notices
 
 
 def test_historical_background_rows_cannot_promote_main_zero(env):
@@ -144,32 +129,6 @@ def test_historical_background_rows_cannot_promote_main_zero(env):
     background = [exact_row(ts=i, api_request_id=f's:review-{i}:turn:api:1') for i in range(3)]
     target = exact_row(ts=4, cause=None, cache_read_tokens=0)
     assert not env.plugin.evaluate_observations(background + [target])[-1]['evaluable']
-
-
-def test_recovery_with_only_background_rows_does_not_invent_main_history(env):
-    from test_detector import exact_row
-    p = env.plugin
-    append_observation(p, exact_row(ts=100, api_request_id='s:review:turn:api:1'))
-    put_session(p, 's', {'last_api_ts':100, 'model':'p/m', 'api_mode':'anthropic',
-                         'prompt_tokens':100, 'guard_sends':{'main':90}})
-    assert p._get_session('s') == {'guard_sends':{'main':90}}
-
-
-def test_background_journal_recovery_after_failed_main_state_write(env, monkeypatch):
-    install_normalizer(monkeypatch)
-    p = env.plugin
-    now = [100.0]
-    monkeypatch.setattr(p.time, 'time', lambda: now[0])
-    send(env, {'prompt_tokens': 18731, 'cached': 11776}, task_id='s')
-    def fail(*a):
-        raise OSError('session state write failed')
-    monkeypatch.setattr(p, '_write_json_atomic', fail)
-    now[0] = 120.0
-    send(env, {'prompt_tokens':18752, 'cached':18560}, task_id='s')
-    now[0] = 130.0
-    send(env, {'prompt_tokens':20944, 'cached':18560}, task_id='memory')
-    recovered = p._get_session('s')
-    assert recovered['last_api_ts'] == 120 and recovered['prompt_tokens'] == 18752
 
 
 def test_background_returns_without_usage_and_concurrent_returns_are_preserved(env, monkeypatch):
@@ -204,7 +163,7 @@ def test_dispatch_is_after_hold_and_gap_uses_previous_response(env, monkeypatch)
     monkeypatch.setattr(p.time, 'time', lambda: now[0])
     send(env, {'prompt_tokens': 60000, 'cached': 59000})
     now[0] = 500.0
-    env.settings.update(cli='block', min_gap_seconds=300)
+    env.settings.update(cli='block', pause_m=5)
     def answer(*a, **k):
         now[0] = 550.0
         return 'once'
@@ -300,7 +259,7 @@ def test_unanswered_cli_confirmation_cancels_without_provider(env):
 def test_send_cooldown_survives_failed_provider_but_deny_does_not(env, monkeypatch):
     import pytest
     p = env.plugin
-    env.settings.update(cli='block', min_gap_seconds=300)
+    env.settings.update(cli='block', pause_m=5)
     seed_session(env, session_id='s', ago=3600)
     decisions = []
     env.approval = lambda *a, **k: (decisions.append('once'), 'once')[1]
@@ -325,7 +284,7 @@ def test_send_cooldown_survives_failed_provider_but_deny_does_not(env, monkeypat
     assert decisions == ['once', 'deny', 'deny']
 
 
-def test_api_mode_change_guard_is_independent_of_short_idle(env, monkeypatch):
+def test_api_mode_change_with_same_model_opens_model_change_box(env, monkeypatch):
     install_normalizer(monkeypatch)
     send(env, {'prompt_tokens': 30000, 'cached': 29000})
     env.settings['cli'] = 'block'
@@ -335,39 +294,15 @@ def test_api_mode_change_guard_is_independent_of_short_idle(env, monkeypatch):
     assert len(env.plugin._load_observations()) == 1
 
 
-def test_journal_recovers_session_after_atomic_state_write_fails(env, monkeypatch):
-    install_normalizer(monkeypatch)
-    p = env.plugin
-    now = [100.0]
-    monkeypatch.setattr(p.time, 'time', lambda: now[0])
-    send(env, {'prompt_tokens': 30000, 'cached': 29000})
-    p._remember_send(dict(session_id='s', provider='p', model='m', api_mode='chat_completions'), 150)
-    original_write = p._write_json_atomic
-    def fail_state(*args):
-        raise OSError('session replacement failed')
-    monkeypatch.setattr(p, '_write_json_atomic', fail_state)
-    now[0] = 200.0
-    send(env, {'prompt_tokens': 31000, 'cached': 30000}, api_mode='responses')
-    monkeypatch.setattr(p, '_write_json_atomic', original_write)
-    rec = p._get_session('s')
-    assert rec['last_api_ts'] == 200.0 and rec['api_mode'] == 'responses'
-    assert rec['guard_sends']
-    now[0] = 210.0
-    send(env, {'prompt_tokens': 32000, 'cached': 31000}, api_mode='responses')
-    row = p._load_observations()[-1]
-    assert row['gap_s'] == 10.0 and row['prev_prompt_tokens'] == 31000
-    assert row['cause'] is None
-
-
 def test_unquoted_yaml_off_means_off(env, monkeypatch):
     import sys
     import yaml
     raw = yaml.safe_load("plugins:\n  entries:\n    cacheguard:\n      settings:\n"
-                         "        cli: off\n        desktop: off\n        gateway: off\n        model_change: off\n")
+                         "        cli: off\n        desktop: off\n        gateway: off\n")
     assert raw['plugins']['entries']['cacheguard']['settings']['cli'] is False
     monkeypatch.setattr(sys.modules['hermes_cli.config'], 'read_raw_config', lambda: raw)
     cfg = env.plugin._cfg()
-    assert [cfg[k] for k in ('cli', 'desktop', 'gateway', 'model_change')] == ['off'] * 4
+    assert [cfg[k] for k in ('cli', 'desktop', 'gateway')] == ['off'] * 3
     assert not env.plugin._H['config_errors']
 
 
@@ -397,31 +332,29 @@ def test_warn_label_only_when_cost_is_likely(env):
     p = env.plugin
     reused = {'evaluable': True, 'cold': False, 'cache_read_tokens': 59000, 'gap_s': 3600}
     cold = {'evaluable': True, 'cold': True, 'miss_delta': 59000, 'gap_s': 3600}
-    for row, label in ((reused, 'OK ·'), (cold, 'WARN ·')):
+    for row, label in ((reused, 'OK '), (cold, 'WARN ')):
         p._WARNED['s'] = 'note'
         p._queue_outcome({'session_id': 's'}, True, row, display_on_success=True)
         assert label in p._PENDING.pop('s')
 
 
 def test_zero_cached_without_baseline_says_so(env):
-    row = {'evaluable': False, 'comparable': True, 'approximate': False, 'cause': None,
+    row = {'evaluable': False, 'comparable': True, 'cause': None,
            'prompt_tokens': 50000, 'cache_read_tokens': 0, 'api_mode': 'chat_completions',
            'model': 'p/m', 'gap_s': 3600}
     text = env.plugin._outcome_text(row)
-    assert text.startswith('Cache status unknown after a 60-minute pause · not enough earlier cache hits to judge')
-    assert 'insufficient' not in text
+    assert text == 'cache unknown, too few cache hits, 60 min'
 
 
 def test_first_call_of_chat_says_it_is_normal(env):
     row = {'evaluable': False, 'cause': 'start', 'gap_s': None, 'prompt_tokens': 50000,
            'cache_read_tokens': 0, 'api_mode': 'chat_completions', 'model': 'p/m'}
-    assert env.plugin._outcome_text(row) == (
-        'Cache status unknown · first call, nothing to compare yet')
+    assert env.plugin._outcome_text(row) == 'cache unknown, first call'
 
 
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_gateway_block_without_approval_path_warns_and_says_degraded(env, monkeypatch, trigger):
-    env.config.update(gateway="block", cli="off", model_change="block", min_context_tokens=1000)
+    env.config.update(gateway="block", cli="off", size_k=1)
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:

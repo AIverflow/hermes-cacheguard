@@ -8,7 +8,6 @@ from conftest import run_middleware, seed_session
 def _denial(env, *, session_id="current-session", model_change=False):
     env.settings["cli"] = "block"
     if model_change:
-        env.settings["model_change"] = "block"
         seed_session(env, session_id=session_id, model="p/old", ago=5)
     else:
         seed_session(env, session_id=session_id, ago=3600)
@@ -50,4 +49,4 @@ def test_denial_without_session_omits_the_session_id(env):
 def test_denial_quotes_session_id_safely(env, session_id):
     text = env.plugin._deny_text(session_id)
     assert f"Session ID: {json.dumps(session_id, ensure_ascii=False)[1:-1]}" in text
-    assert text.count("\n") == 2  # the id stays on one line (json escaping)
+    assert len(text.splitlines()) == 2  # the id stays on one line (json escaping)

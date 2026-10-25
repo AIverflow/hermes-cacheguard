@@ -70,7 +70,7 @@ def test_small_trim_after_long_pause_is_judged_for_cache_loss(env):
     assert row["cause"] is None and row["gap_s"] == 3932
     verdict = env.plugin.evaluate_observations([exact_row(prompt_tokens=85179), row])[-1]
     text = env.plugin._outcome_text(verdict)
-    assert "cache lost" in text and "tokens reloaded" in text
+    assert text.startswith("cache lost") and "rebilled" in text
 
 
 def test_two_percent_trim_with_full_cache_read_is_judged_as_reused(env):
@@ -79,7 +79,7 @@ def test_two_percent_trim_with_full_cache_read_is_judged_as_reused(env):
     assert row["cause"] is None
     verdict = env.plugin.evaluate_observations([exact_row(prompt_tokens=85179), row])[-1]
     text = env.plugin._outcome_text(verdict)
-    assert "tokens reused" in text and "context changed" not in text
+    assert "reused" in text and "context changed" not in text
 
 
 def test_twenty_percent_drop_is_still_context_changed(env):
@@ -115,13 +115,9 @@ def test_zero_uses_three_profile_wide_hits_across_sessions(env):
     assert unpromoted["evaluable"] is False and unpromoted["cold"] is None
 
 
-def test_old_rows_and_noncomparable_rows_are_non_evaluable(env):
-    old = {"ts": 1, "session_id": "s", "model": "p/m", "prompt_tokens": 100,
-           "cache_read_tokens": 0, "gap_s": 1}
+def test_noncomparable_rows_are_non_evaluable(env):
     failed = exact_row(ts=2, cause="start", prev_prompt_tokens=100)
-    old_result, failed_result = env.plugin.evaluate_observations([old, failed])
-    assert old_result["approximate"] is True and old_result["evaluable"] is False
-    assert old_result["miss_delta"] is None and old_result["cold"] is None
+    (failed_result,) = env.plugin.evaluate_observations([failed])
     assert failed_result["evaluable"] is False and failed_result["cold"] is None
 
 

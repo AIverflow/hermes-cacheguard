@@ -34,13 +34,13 @@ def test_report_uses_seven_fixed_idle_buckets_and_excludes_short_pauses(env):
     assert re.findall(r'\d+/\d+', data) == ['1/1', '0/1', '1/1', '0/1']
 
 
-def test_report_shows_percent_only_from_ten_calls(env):
+def test_report_cells_are_counts_with_no_percent(env):
     env.plugin._load_observations = lambda: [observation(ts=i) for i in range(25)]
     out = env.plugin._cmd_show("all")
-    assert "0% (25)" in out and "0/25" not in out
+    assert "0/25" in out and "%" not in out
     env.plugin._load_observations = lambda: [observation(ts=i) for i in range(9)]
     out = env.plugin._cmd_show("all")
-    assert "0/9" in out and "0% (9)" not in out
+    assert "0/9" in out and "%" not in out
 
 
 def test_bucket_boundaries_count_each_call_in_one_column(env):
@@ -62,7 +62,7 @@ def test_report_keeps_rare_cold_visible(env):
     rows = [observation(ts=i) for i in range(2000)]
     rows.append(observation(ts=2001, read=0))
     env.plugin._load_observations = lambda: rows
-    assert "<0.1% (2001)" in env.plugin._cmd_show('all')
+    assert "1/2001" in env.plugin._cmd_show('all')
 
 
 def test_report_aligns_long_model_and_bucket_cells(env):
@@ -110,9 +110,9 @@ def test_twelve_zero_reads_never_show_a_full_loss(env):
     rows = [observation(gap=600, read=0, ts=i) for i in range(12)]
     env.plugin._load_observations = lambda: rows
     assert not any(r['evaluable'] for r in env.plugin.evaluate_observations(rows))
-    cells = env.plugin._cold_cells(rows, env.plugin.evaluate_observations(rows))[False]
+    cells = env.plugin._cold_cells(rows, env.plugin.evaluate_observations(rows))
     assert sum(c['calls'] for c in cells.get('p/m', [])) == 0
-    assert env.plugin._cold_chance('p/m', 600) is None
+    assert env.plugin._cold_counts('p/m', 600) is None
     assert '100%' not in env.plugin._cmd_show('all')
 
 
@@ -145,17 +145,6 @@ def test_report_uses_positive_evidence_older_than_twenty_thousand_rows(env):
     assert '20,005 measured pauses' in out and '1/4' in out
 
 
-def test_debug_marks_old_rows_approximate_without_calling_them_new_cold(env):
-    rows = [
-        {"ts": 1, "session_id": "old", "model": "p/m", "gap_s": 1,
-         "prompt_tokens": 100, "cache_read_tokens": 0, "cold": True},
-        observation(session_id="new", cause="start", ts=2),
-    ]
-    env.plugin._load_observations = lambda: rows
-    out = env.plugin._cmd_debug([])
-    assert "APPROXIMATE" in out and "LEGACY COLD" in out
-
-
 def test_reset_clears_observations_and_sessions(env):
     p = env.plugin
     append_observation(p, observation())
@@ -178,8 +167,8 @@ def test_no_usable_observations_says_why(env):
 
 
 def test_header_shows_effective_desktop_value(env):
-    env.settings.update(cli='block')  # desktop unset: it follows cli
-    assert env.plugin._cmd_show().splitlines()[0].startswith('cacheguard  ·  cli block  ·  desktop block  ·  ')
+    env.settings.update(cli='block')  # desktop has its own mode: default warn
+    assert env.plugin._cmd_show().splitlines()[0].startswith('cacheguard  ·  cli block  ·  desktop warn  ·  ')
 
 
 def test_header_counts_calls_recorded_and_in_table(env):
@@ -198,7 +187,7 @@ def test_header_without_table_says_only_calls_recorded(env):
 
 
 def test_setup_hint_echoes_current_settings(env):
-    env.settings.update(min_gap_seconds=600, min_context_tokens=30000)
+    env.settings.update(pause_m=10, size_k=30)
     out = env.plugin._cmd_show()
     assert 'setup all block 10 30' in out and 'after a 10 minute pause, size over 30k tokens' in out
 
@@ -208,7 +197,7 @@ def test_rebilled_count_is_capped_by_what_was_sent(env):
     verdict = env.plugin.evaluate_observations(rows)[0]
     assert verdict['evaluable'] and verdict['cold']
     assert verdict['miss_delta'] <= 94999
-    assert "94,999 tokens reloaded" in env.plugin._outcome_text(verdict)
+    assert "95k rebilled" in env.plugin._outcome_text(verdict)
 
 
 def _journal_path(env):
@@ -239,3 +228,84 @@ def test_trim_survives_invalid_utf8_line(env):
         env.plugin._trim_observations(1000)
     lines = path.read_bytes().split(b"\n")[:-1]
     assert len(lines) == 1000 and json.loads(lines[-1])["n"] == 1199
+
+
+# ---- suggested pause column -------------------------------------------------
+def _warmup():
+    return [observation(gap=0, ts=i) for i in range(3)]  # earlier reads, so a zero read is a loss
+
+
+def _gap_rows(spec, model="p/m"):
+    """spec: [(gap, lost)] -> rows after a short warm-up."""
+    rows = _warmup()
+    rows += [observation(model=model, gap=gap, read=0 if lost else 100, ts=10 + i)
+             for i, (gap, lost) in enumerate(spec)]
+    return rows
+
+
+def test_loss_blocks_are_monotone_and_merge_a_violating_pair(env):
+    blocks = env.plugin._loss_blocks([(100, True), (200, False), (300, False), (400, True)])
+    assert [(b[0], b[1], b[3]) for b in blocks] == [(100, 300, 3), (400, 400, 1)]
+    assert blocks[0][2] == pytest.approx(1 / 3) and blocks[1][2] == 1.0
+    shares = [b[2] for b in env.plugin._loss_blocks(
+        [(g, (g * 7) % 3 == 0) for g in range(60, 1000, 13)])]
+    assert shares == sorted(shares)
+    assert env.plugin._loss_blocks([]) == []
+
+
+def test_loss_blocks_without_violation_stay_apart(env):
+    blocks = env.plugin._loss_blocks([(100, False), (200, False), (300, True)])
+    assert [(b[0], b[1], b[2]) for b in blocks] == [(100, 100, 0.0), (200, 200, 0.0), (300, 300, 1.0)]
+
+
+def test_short_pause_text(env):
+    f = env.plugin._short_pause
+    assert [f(s) for s in (300, 960, 3600, 4800, 3660, 7200)] == ["5m", "16m", "1h", "1h20", "1h01", "2h"]
+
+
+def test_suggested_pause_all_kept_is_the_longest_pause_with_plus(env):
+    pts = [(300.0 + 60 * i, False) for i in range(25)]
+    assert env.plugin._suggested_pause(pts) == "29m+"
+
+
+def test_suggested_pause_has_no_plus_when_a_later_block_exceeds(env):
+    pts = [(300.0 + 10 * i, False) for i in range(30)] + [(1000.0 + i, True) for i in range(10)]
+    assert env.plugin._suggested_pause(pts) == "9m"
+
+
+def test_suggested_pause_stops_before_the_losses(env):
+    pts = [(300.0 + 10 * i, False) for i in range(30)] + [(1000.0 + i, True) for i in range(10)]
+    assert env.plugin._suggested_pause(pts) == "9m"  # last kept pause 590 s
+
+
+def test_suggested_pause_none_for_early_losses(env):
+    pts = [(100.0 + i, True) for i in range(5)] + [(200.0 + i, False) for i in range(20)]
+    assert env.plugin._suggested_pause(pts) == "none"
+
+
+def test_suggested_pause_needs_twenty_calls(env):
+    assert env.plugin._suggested_pause([(300.0 + i, False) for i in range(19)]) == "—"
+    assert env.plugin._suggested_pause([(300.0 + i, False) for i in range(20)]) == "5m+"
+
+
+def test_cacheguard_table_has_the_suggested_column(env):
+    spec = [(300 + 20 * i, False) for i in range(30)] + [(3000 + i, True) for i in range(10)]
+    rows = _gap_rows(spec) + _gap_rows([(400, False)] * 3, model="p/few")[3:]
+    env.plugin._load_observations = lambda: rows
+    out = env.plugin._cmd_show("all")
+    table = [ln for ln in out.splitlines() if ln.startswith(("model", "p/m", "p/few"))]
+    assert table[0].rstrip().endswith("suggested")
+    by_model = {ln.split()[0]: ln.split()[-1] for ln in table[1:]}
+    assert by_model == {"p/m": "14m", "p/few": "—"}
+    assert len({len(ln) for ln in table}) == 1  # same right-justified width
+
+
+def test_suggested_failure_leaves_the_cell_out(env):
+    def boom(points):
+        raise RuntimeError("x")
+    env.plugin._loss_blocks = boom
+    rows = _gap_rows([(300 + 20 * i, False) for i in range(25)])
+    env.plugin._load_observations = lambda: rows
+    out = env.plugin._cmd_show("all")
+    line = next(ln for ln in out.splitlines() if ln.startswith("p/m"))
+    assert line.split()[-1] == "—" and "0/22" in line

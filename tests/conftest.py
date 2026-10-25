@@ -17,19 +17,31 @@ class Env:
     def __init__(self, home, plugin):
         self.home = home
         self.plugin = plugin
-        self.config = {}          # legacy top-level `cacheguard:` block
         self.settings = {}        # plugins.entries.cacheguard.settings
         self.approval = None  # callable or None (no callback available)
         self.bot_managed = False
         self.write_origin = "foreground"  # Hermes' default skill write origin (main agent)
-        self.printed = []
+        self.posted = []          # texts given to ctx.post_message
+        self.post_ok = True       # False: post_message returns ok=False; an Exception: it raises
+
+    @property
+    def config(self):  # same mapping as `settings`; older tests use this name
+        return self.settings
+
+    @config.setter
+    def config(self, value):
+        self.settings = value
+
+    @property
+    def notices(self):  # one-off notices waiting to be posted (reasons, without the prefix)
+        return list(self.plugin._H["pending_notices"])
 
     def warned(self, sid="s1"):
         """The warn-mode marker (or the queued result line carrying it), else None."""
         if sid in self.plugin._WARNED:
             return self.plugin._WARNED[sid]
         note = self.plugin._PENDING.get(sid)
-        return note if note and ("WARN ·" in note or "OK ·" in note) else None
+        return note if note and (note.startswith("CGUARD WARN ") or note.startswith("CGUARD OK ")) else None
 
     def db(self):
         con = sqlite3.connect(self.home / "state.db")
@@ -60,7 +72,8 @@ def env(tmp_path, monkeypatch):
 
     e = Env(tmp_path, plugin)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    def normalize(raw, *, provider=None, api_mode=None):
+    def normalize(response_usage, *, provider=None, api_mode=None):
+        raw = response_usage
         # Same shape as Hermes' CanonicalUsage: Chat totals include cache, prompt_tokens is the sum back.
         from types import SimpleNamespace
         read, write = raw.get("cache_read_tokens", 0), raw.get("cache_write_tokens", 0)
@@ -72,7 +85,6 @@ def env(tmp_path, monkeypatch):
         "hermes_constants": _mod("hermes_constants", get_hermes_home=lambda: tmp_path),
         "hermes_cli": _mod("hermes_cli"),
         "hermes_cli.config": _mod("hermes_cli.config", read_raw_config=lambda: {
-            "cacheguard": dict(e.config),
             "plugins": {"entries": {"cacheguard": {"settings": dict(e.settings)}}},
         }),
         "tools": _mod("tools"),
@@ -80,8 +92,15 @@ def env(tmp_path, monkeypatch):
                                       is_bot_mode_managed=lambda home=None: e.bot_managed),
         "tools.skill_provenance": _mod("tools.skill_provenance", get_current_write_origin=lambda: e.write_origin),
         "tools.terminal_tool": _mod("tools.terminal_tool", _get_approval_callback=lambda: e.approval),
-        "cli": _mod("cli", _cli_visible_print=e.printed.append),
     }
+    def post_message(text):
+        if isinstance(e.post_ok, Exception):
+            raise e.post_ok
+        if e.post_ok:
+            e.posted.append(text)  # only what was really posted
+        return types.SimpleNamespace(ok=bool(e.post_ok), error=None if e.post_ok else "no conversation")
+
+    plugin._CTX = types.SimpleNamespace(post_message=post_message)
     for name, mod in fakes.items():
         monkeypatch.setitem(sys.modules, name, mod)
     return e
@@ -161,7 +180,7 @@ def make_hermes_home(fake_provider):
 @pytest.fixture
 def webui(hermes_python, make_hermes_home):
     from e2e_support import WebUI
-    home = make_hermes_home(cli="block")
+    home = make_hermes_home(desktop="block")  # the web UI is in the desktop group
     ui = WebUI(hermes_python, home)
     ui.home = home
     yield ui
