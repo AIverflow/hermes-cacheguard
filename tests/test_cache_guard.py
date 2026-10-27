@@ -2710,12 +2710,17 @@ def test_gateway_decision_only_explicit_allow_sends(env, monkeypatch, decision, 
 
 
 def test_storage_lock_gives_up_instead_of_waiting(env, monkeypatch):
-    import fcntl
     import time
 
     monkeypatch.setattr(env.plugin, "_LOCK_WAIT_S", 0.1)
     with open(env.plugin._state_dir() / ".lock", "a+") as other:
-        fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+        if sys.platform == "win32":
+            import msvcrt
+            other.seek(0)
+            msvcrt.locking(other.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX)
         start = time.monotonic()
         with pytest.raises(TimeoutError):
             with env.plugin._storage_lock():
