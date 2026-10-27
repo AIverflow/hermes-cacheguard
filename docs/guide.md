@@ -168,3 +168,7 @@ If cacheguard fails, your message is sent. Only a Cancel you already gave stays 
 - A warning is a guess, not proof that the cache expired.
 - cacheguard counts tokens, not dollars.
 - Calls that bypass the Hermes middleware (e.g. `codex_app_server`) are not seen.
+
+## For maintainers: daily Hermes check
+
+`.github/workflows/hermes-compat.yml` runs every day (and on demand). It installs Hermes at the version in `requires_hermes`, at the latest release and at `main`, on Ubuntu, Windows and macOS, then runs `hermes plugins validate`, `scripts/hermes_compat.py` (the `/cacheguard` health checks) and the tests. A failing cell does not fail the run: see the table in the run summary. A Telegram alert goes out only when a cell changes (pass to fail or back, a new cell, or a new Hermes release). The last state is kept in the `hermes-compat-state` artifact. Secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; if one is missing, no alert is sent. GitHub pauses scheduled workflows after 60 days without repo activity: re-enable it in the Actions tab.

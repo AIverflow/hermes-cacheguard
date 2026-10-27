@@ -1,0 +1,151 @@
+name: hermes-compat
+
+# Daily: does the plugin still work with the Hermes floor, the latest release and main?
+# One cell = one Hermes ref on one OS. A failing cell does not fail the run: the state of every
+# cell is in the run summary, and an alert (Telegram) goes out only when a cell changes.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+concurrency: hermes-compat
+
+permissions:
+  contents: read
+  actions: read  # read last run's state artifact
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+      latest: ${{ steps.refs.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # floor = the version in requires_hermes (">=0.22.2" -> tag v0.22.2)
+          floor=v$(sed -nE 's/^requires_hermes:.*>=[[:space:]]*([0-9][0-9.]*).*/\1/p' plugin.yaml)
+          latest=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          if [ "$floor" = v ] || [ -z "$latest" ]; then echo "::error::no floor or latest release"; exit 1; fi
+          echo "refs=$(jq -cn --arg a "$floor" --arg b "$latest" '[$a, $b, "main"] | unique')" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: plan
+    name: ${{ matrix.ref }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        ref: ${{ fromJSON(needs.plan.outputs.refs) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test tools
+        run: |
+          python -m pip install pytest pyyaml
+          echo "PLUGIN_PYTHON=$(command -v python)" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/logs" "$RUNNER_TEMP/cell"
+
+      # Hermes installs through its own tool manager (pm), not pip: most of its pyproject
+      # dependencies only apply to Python 3.14, which pm fetches itself. These steps are the
+      # ones Hermes' own CI runs (.github/actions/setup-pm and plugin-validate).
+      - name: Get Hermes and its Python
+        id: fetch
+        continue-on-error: true
+        env:
+          REF: ${{ matrix.ref }}
+        run: |
+          src="$RUNNER_TEMP/hermes"
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$src" fetch -q --depth=1 -- origin "$REF"
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          cd "$src"
+          python -S scripts/ci/setup_toolchain.py prepare --toolchain python --home "$src/.build/pm"
+          python -S scripts/ci/setup_toolchain.py install --toolchain python --home "$src/.build/pm"
+      - name: Install Hermes
+        id: install
+        if: steps.fetch.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/hermes
+        run: '"$HERMES_PYTHON" -S scripts/ci/setup_toolchain.py dependencies --toolchain python --extras "[]" --home "$HERMES_HOME"'
+
+      - name: hermes plugins validate
+        id: validate
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: hermes plugins validate . 2>&1 | tee "$RUNNER_TEMP/logs/validate.txt"
+      - name: Health checks (scripts/hermes_compat.py)
+        id: compat
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: '"$HERMES_PYTHON" scripts/hermes_compat.py 2>&1 | tee "$RUNNER_TEMP/logs/compat.txt"'
+      - name: Plugin tests
+        id: pytest
+        if: always()
+        continue-on-error: true
+        # Plain Python 3.12 without Hermes on its path: same as the ci workflow.
+        run: env -u PYTHONPATH "$PLUGIN_PYTHON" -m pytest -q 2>&1 | tee "$RUNNER_TEMP/logs/pytest.txt"
+
+      - name: Cell result
+        if: always()
+        env:
+          REF: ${{ matrix.ref }}
+          OS_NAME: ${{ matrix.os }}
+        run: >
+          "$PLUGIN_PYTHON" scripts/hermes_compat_alert.py cell --os "$OS_NAME" --ref "$REF"
+          --logs "$RUNNER_TEMP/logs" --out "$RUNNER_TEMP/cell/cell-$OS_NAME-$REF.json"
+          fetch=${{ steps.fetch.outcome }} install=${{ steps.install.outcome }}
+          validate=${{ steps.validate.outcome }} compat=${{ steps.compat.outcome }}
+          pytest=${{ steps.pytest.outcome }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cell-${{ matrix.os }}-${{ matrix.ref }}
+          path: ${{ runner.temp }}/cell
+
+  report:
+    needs: [plan, check]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cell-*
+          path: cells
+          merge-multiple: true
+      - name: Get last run's state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir prev
+          url=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=hermes-compat-state&per_page=1" \
+            --jq '.artifacts[0] | select(.expired == false) | .archive_download_url')
+          if [ -n "$url" ]; then gh api "$url" > prev.zip && unzip -q prev.zip -d prev; fi
+      - name: Compare, alert on change
+        env:
+          LATEST: ${{ needs.plan.outputs.latest }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: >
+          python3 scripts/hermes_compat_alert.py report --cells cells --prev prev/state.json
+          --state-out state.json --latest "$LATEST" --run-url "$RUN_URL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hermes-compat-state
+          path: state.json
+          retention-days: 90
+          if-no-files-found: ignore
