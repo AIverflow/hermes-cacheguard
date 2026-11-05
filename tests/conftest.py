@@ -109,7 +109,10 @@ class PluginView:
 
     Reading finds the name in the package, then in each module. Writing (monkeypatch.setattr) goes
     to the module that holds the name: that is the module whose code reads it.
+    No instance __dict__: pytest's monkeypatch then saves the old value with getattr, so undo restores it.
     """
+
+    __slots__ = ("_modules",)
 
     def __init__(self, package):
         object.__setattr__(self, "_modules", [package, *(

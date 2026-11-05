@@ -1264,7 +1264,7 @@ def test_background_call_does_not_read_nor_change_the_pending_hash(env, monkeypa
     monkeypatch.setattr(p, "_get_session", lambda sid: 1 / 0)  # a read would raise
     before = dict(p._PREFIX_PENDING)
     p._note_prefix({"session_id": "s", "task_id": "other", "api_request_id": "r"}, _msgs(8, mid="aux"))
-    assert p._PREFIX_PENDING == before
+    assert before == p._PREFIX_PENDING
 
 
 def test_call_without_a_session_id_notes_no_hash(env):
