@@ -1,4 +1,5 @@
 import json
+
 import pytest
 from conftest import append_observation, put_session
 
@@ -9,10 +10,9 @@ def _show_small_tables(env):
 
 
 def observation(model="p/m", *, gap=90, prompt=100, read=100, expected=100,
-                cause=None, api_mode="anthropic", session_id="s", ts=1):
+                cause=None, api_mode="anthropic", ts=1):
     return {
-        "ts": ts, "session_id": session_id, "model": model, "api_mode": api_mode,
-        "api_request_id": str(ts), "gap_s": gap, "prompt_tokens": prompt,
+        "ts": ts, "model": model, "api_mode": api_mode, "gap_s": gap, "prompt_tokens": prompt,
         "cache_read_tokens": read, "cache_write_tokens": 0,
         "prev_prompt_tokens": expected, "cause": cause,
     }
@@ -94,7 +94,7 @@ def test_report_hides_old_rows_without_mutation(env):
     assert not env.plugin.evaluate_observations(rows)[0]['evaluable']
 
 
-def test_report_includes_zero_reads_but_guard_still_requires_three_positives(env):
+def test_report_includes_zero_reads_but_guard_still_requires_two_positives(env):
     rows = [observation(), observation(read=0), observation(cause='start'), observation(cause='rewrite'),
             observation(cause='usage_missing', read=None),
             observation(cause='auxiliary'), observation(gap=float('nan')),
@@ -110,7 +110,7 @@ def test_twelve_zero_reads_never_show_a_full_loss(env):
     rows = [observation(gap=600, read=0, ts=i) for i in range(12)]
     env.plugin._load_observations = lambda: rows
     assert not any(r['evaluable'] for r in env.plugin.evaluate_observations(rows))
-    cells = env.plugin._cold_cells(rows, env.plugin.evaluate_observations(rows))
+    cells = env.plugin._cold_cells(env.plugin.evaluate_observations(rows))
     assert sum(c['calls'] for c in cells.get('p/m', [])) == 0
     assert env.plugin._cold_counts('p/m', 600) is None
     assert '100%' not in env.plugin._cmd_show('all')
@@ -120,7 +120,7 @@ def test_report_hides_models_without_usable_data(env):
     env.plugin._load_observations = lambda: [observation(cause='start', gap=None)]
     out = env.plugin._cmd_show('all')
     assert not any(line.startswith('p/m') for line in out.splitlines())
-    assert 'no usable pause observations yet' in out
+    assert 'nothing counted yet' in out
     assert '(1 -)' not in out and 'unknown pause' not in out
 
 
@@ -138,7 +138,7 @@ def test_report_top_ten_and_filter_use_profile_data(env):
 
 def test_report_uses_positive_evidence_older_than_twenty_thousand_rows(env):
     rows = [observation(ts=i) for i in range(3)]
-    rows.extend(observation(model='other/model', session_id='other', ts=i+3) for i in range(20001))
+    rows.extend(observation(model='other/model', ts=i+3) for i in range(20001))
     rows.append(observation(read=0,ts=30000))
     env.plugin._load_observations = lambda: rows
     out = env.plugin._cmd_show('all')
@@ -163,7 +163,7 @@ def test_command_keeps_blank_lines_for_tui_pager(env):
 def test_no_usable_observations_says_why(env):
     env.plugin._load_observations = lambda: [observation(gap=30)]
     out = env.plugin._cmd_show('all')
-    assert 'no usable pause observations yet' in out and 'pauses under 1 min are not shown' in out
+    assert 'nothing counted yet' in out
 
 
 def test_header_shows_effective_desktop_value(env):
@@ -205,15 +205,15 @@ def _journal_path(env):
 
 
 def test_damaged_last_line_only_loses_itself(env):
-    good = [observation(ts=i, session_id=f"s{i}") for i in range(3)]
+    good = [observation(ts=i) for i in range(3)]
     for row in good:
         append_observation(env.plugin, row)
-    cut = '{"ts": 9, "model": "p/é'.encode("utf-8")[:-1]  # ends inside a multi-byte character
+    cut = '{"ts": 9, "model": "p/é'.encode()[:-1]  # ends inside a multi-byte character
     with open(_journal_path(env), "ab") as fh:
         fh.write(cut)
-    append_observation(env.plugin, observation(ts=10, session_id="after"))
+    append_observation(env.plugin, observation(ts=10))
     rows = env.plugin._load_observations()
-    assert [r["session_id"] for r in rows] == ["s0", "s1", "s2", "after"]
+    assert [r["ts"] for r in rows] == [0, 1, 2, 10]
     assert "invalid observation rows skipped" in env.plugin._H["data_errors"]
 
 

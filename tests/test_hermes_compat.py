@@ -24,8 +24,11 @@ alert = load("hermes_compat_alert")
 # --- scripts/hermes_compat.py ---
 
 def run_compat(tmp_path, health):
-    plugin = tmp_path / "plugin.py"
-    plugin.write_text(f"def _health():\n    return {health!r}\n")
+    plugin = tmp_path / "plugin" / "__init__.py"  # a folder with the two modules the script reads
+    plugin.parent.mkdir()
+    plugin.write_text("from . import config, health\n")
+    (plugin.parent / "config.py").write_text("")
+    (plugin.parent / "health.py").write_text(f"def _health():\n    return {health!r}\n")
     return subprocess.run([sys.executable, str(SCRIPTS / "hermes_compat.py"), str(plugin)],
                           text=True, capture_output=True)
 

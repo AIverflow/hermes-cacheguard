@@ -1,0 +1,8 @@
+# CI and the editor read the same rules.
+target-version = "py311"  # oldest Python in the CI matrix
+
+[lint]
+select = ["E4", "E7", "E9", "F", "B", "I", "UP", "SIM"]
+# The plugin never raises into Hermes: an explicit try/except/pass is the intended pattern.
+# The web UI test keeps its log file open for the whole run.
+ignore = ["SIM105", "SIM115"]

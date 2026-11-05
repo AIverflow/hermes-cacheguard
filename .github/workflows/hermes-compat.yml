@@ -21,12 +21,12 @@ jobs:
       refs: ${{ steps.refs.outputs.refs }}
       latest: ${{ steps.refs.outputs.latest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: refs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # floor = the version in requires_hermes (">=0.22.2" -> tag v0.22.2)
+          # floor = the version in requires_hermes (">=0.22.5" -> tag v0.22.5)
           floor=v$(sed -nE 's/^requires_hermes:.*>=[[:space:]]*([0-9][0-9.]*).*/\1/p' plugin.yaml)
           latest=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
           if [ "$floor" = v ] || [ -z "$latest" ]; then echo "::error::no floor or latest release"; exit 1; fi
@@ -47,8 +47,8 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - name: Install test tools
@@ -86,6 +86,11 @@ jobs:
         if: steps.install.outcome == 'success'
         continue-on-error: true
         run: hermes plugins validate . 2>&1 | tee "$RUNNER_TEMP/logs/validate.txt"
+      - name: hermes plugins doctor
+        id: doctor
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: hermes plugins doctor . --ci 2>&1 | tee "$RUNNER_TEMP/logs/doctor.txt"
       - name: Health checks (scripts/hermes_compat.py)
         id: compat
         if: steps.install.outcome == 'success'
@@ -97,6 +102,15 @@ jobs:
         continue-on-error: true
         # Plain Python 3.12 without Hermes on its path: same as the ci workflow.
         run: env -u PYTHONPATH "$PLUGIN_PYTHON" -m pytest -q 2>&1 | tee "$RUNNER_TEMP/logs/pytest.txt"
+      - name: Live tests (real Hermes, fake provider)
+        id: e2e
+        # Linux and macOS only for now. The tests find the Hermes checkout and its Python through
+        # HERMES_AGENT_DIR and HERMES_PYTHON (set by the install step). No provider call leaves the runner.
+        if: always() && matrix.os != 'windows-latest' && steps.install.outcome == 'success'
+        continue-on-error: true
+        env:
+          HERMES_AGENT_DIR: ${{ runner.temp }}/hermes
+        run: env -u PYTHONPATH "$PLUGIN_PYTHON" -m pytest -q -m e2e -k "not webui" 2>&1 | tee "$RUNNER_TEMP/logs/e2e.txt"
 
       - name: Cell result
         if: always()
@@ -107,8 +121,8 @@ jobs:
           "$PLUGIN_PYTHON" scripts/hermes_compat_alert.py cell --os "$OS_NAME" --ref "$REF"
           --logs "$RUNNER_TEMP/logs" --out "$RUNNER_TEMP/cell/cell-$OS_NAME-$REF.json"
           fetch=${{ steps.fetch.outcome }} install=${{ steps.install.outcome }}
-          validate=${{ steps.validate.outcome }} compat=${{ steps.compat.outcome }}
-          pytest=${{ steps.pytest.outcome }}
+          validate=${{ steps.validate.outcome }} doctor=${{ steps.doctor.outcome }} compat=${{ steps.compat.outcome }}
+          pytest=${{ steps.pytest.outcome }} e2e=${{ steps.e2e.outcome }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -120,7 +134,7 @@ jobs:
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/download-artifact@v4
         with:
           pattern: cell-*

@@ -15,6 +15,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = Path(__file__).resolve().parent / "e2e_runner.py"
 AGENT_DIR = Path(os.environ.get("HERMES_AGENT_DIR") or Path.home() / ".hermes" / "hermes-agent")
+# CI layout: a Hermes source checkout (HERMES_AGENT_DIR) run by its own venv Python (HERMES_PYTHON),
+# no `hermes` launcher and no ~/.hermes/installs store.
+DIRECT = bool(os.environ.get("HERMES_PYTHON") and os.environ.get("HERMES_AGENT_DIR"))
 WEBUI_DIR = Path(os.environ["HERMES_WEBUI_DIR"]) if os.environ.get("HERMES_WEBUI_DIR") else None
 
 
@@ -26,6 +29,10 @@ def free_port():
 
 def hermes_python():
     """Interpreter of the installed Hermes, or skip."""
+    if DIRECT:
+        if not (AGENT_DIR.exists() and Path(os.environ["HERMES_PYTHON"]).is_file()):
+            pytest.skip("HERMES_PYTHON or HERMES_AGENT_DIR does not exist")
+        return os.environ["HERMES_PYTHON"]
     launcher = shutil.which("hermes")
     if launcher is None or not AGENT_DIR.exists():
         pytest.skip("installed Hermes required for e2e tests")
@@ -131,6 +138,8 @@ class HermesHome:
         env.update(HERMES_HOME=str(self.home), HOME=str(self.user_home), HERMES_AGENT_DIR=str(AGENT_DIR),
                    HERMES_DISABLE_LAZY_INSTALLS="1", PYTHONDONTWRITEBYTECODE="1",
                    HERMES_ENABLE_PROJECT_PLUGINS="0", NO_COLOR="1")
+        if DIRECT:
+            env["CACHEGUARD_E2E_DIRECT"] = "1"  # read by e2e_runner.py
         env.update(extra)
         return env
 
@@ -151,27 +160,55 @@ class HermesHome:
                     rec[key] -= seconds
             path.write_text(json.dumps(rec))
 
+    def gateway_pids(self):
+        """PIDs of the processes running with this home as HERMES_HOME.
+
+        Linux: scan every process environment. Everywhere (macOS has no /proc): the pid file the
+        gateway writes in its home, trusted only if it names a Hermes gateway for this home."""
+        pids = set()
+        mark = f"HERMES_HOME={self.home.resolve()}".encode()
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                if mark in (proc / "environ").read_bytes().split(b"\0"):
+                    pids.add(int(proc.name))
+            except OSError:
+                continue
+        for name in ("gateway.pid", "gateway.lock"):
+            try:
+                info = json.loads((self.home / name).read_text())
+                if info["kind"] == "hermes-gateway" and Path(info["hermes_home"]).resolve() == self.home.resolve():
+                    pids.add(int(info["pid"]))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        pids.discard(os.getpid())
+        return sorted(pids)
+
+    @staticmethod
+    def _running(pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        try:  # Linux: a zombie is gone for our purpose
+            return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
+        except (OSError, IndexError):
+            return True
+
     def stop_gateways(self):
         """Stop the gateway children Hermes started for this home (they outlive the CLI call).
 
         Waits for them to exit: a gateway still shutting down writes into the home after rmtree."""
         import time
-        mark = f"HERMES_HOME={self.home.resolve()}".encode()
         pids = []
-        for proc in Path("/proc").glob("[0-9]*"):
+        for pid in self.gateway_pids():
             try:
-                env = (proc / "environ").read_bytes().split(b"\0")
+                os.kill(pid, signal.SIGTERM)
+                pids.append(pid)
             except OSError:
-                continue
-            if mark in env:
-                try:
-                    os.kill(int(proc.name), signal.SIGTERM)
-                    pids.append(int(proc.name))
-                except OSError:
-                    pass
+                pass
         deadline = time.time() + 10
         while pids and time.time() < deadline:
-            pids = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+            pids = [pid for pid in pids if self._running(pid)]
             time.sleep(0.1)
         for pid in pids:
             try:

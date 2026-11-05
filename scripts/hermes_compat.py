@@ -15,15 +15,17 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def failed_checks(plugin_file: Path) -> dict:
     """{check name: reason} for every `_health()` check that failed."""
-    spec = importlib.util.spec_from_file_location("cacheguard_compat", plugin_file)
+    spec = importlib.util.spec_from_file_location("cacheguard_compat", plugin_file,
+                                                  submodule_search_locations=[str(plugin_file.parent)])  # a package, as in Hermes
     plugin = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plugin
     spec.loader.exec_module(plugin)
     try:
         from hermes_cli.plugins import PluginContext
-        plugin._CTX = PluginContext  # no live context here: the class carries the same post_message
+        plugin.config._CTX = PluginContext  # no live context here: the class carries the same post_message
     except Exception:
         pass  # Hermes not importable: its checks fail below, by name
-    return {name: why for name, (ok, why) in plugin._health().items() if not ok}
+    return {name: why for name, (ok, why) in plugin.health._health().items() if not ok}
 
 
 def main(argv: list) -> int:

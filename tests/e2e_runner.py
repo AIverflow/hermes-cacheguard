@@ -5,6 +5,8 @@
 
 Same bootstrap as the gateway contract test: the installed dependency environment is added to
 sys.path instead of letting Hermes build one under the temporary HERMES_HOME (that takes ~1 min).
+With CACHEGUARD_E2E_DIRECT (CI: a source checkout run by its own venv Python) the interpreter
+already has the dependencies: no installs store, no bootstrap.
 """
 import json
 import os
@@ -17,12 +19,13 @@ mode, rest = sys.argv[1], sys.argv[2:]
 agent = Path(os.environ["HERMES_AGENT_DIR"])
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(agent))
-from pm.environments import install_key, site_packages  # noqa: E402
+if not os.environ.get("CACHEGUARD_E2E_DIRECT"):
+    from pm.environments import install_key, site_packages  # noqa: E402
 
-facts = json.loads((agent.parent / "installs" / install_key(agent) / "facts.json").read_text())
-site.addsitedir(str(site_packages(Path(facts["packages"]["venv"]["environment"]))))
-sys.argv = ["hermes", "pm", "repair"]  # Hermes' stdlib entrypoint: skips launch prep and activation
-import hermes_bootstrap  # noqa: E402,F401
+    facts = json.loads((agent.parent / "installs" / install_key(agent) / "facts.json").read_text())
+    site.addsitedir(str(site_packages(Path(facts["packages"]["venv"]["environment"]))))
+    sys.argv = ["hermes", "pm", "repair"]  # Hermes' stdlib entrypoint: skips launch prep and activation
+    import hermes_bootstrap  # noqa: E402,F401
 
 if mode == "cli":
     sys.argv = ["hermes"] + rest

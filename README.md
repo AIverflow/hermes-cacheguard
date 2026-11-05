@@ -7,7 +7,7 @@ After a pause, the provider may have dropped your cache. Your next message in a 
 
 cacheguard can ask before sending it (`block`) or tell you afterwards what was reused or rebilled (`warn`).
 It learns from your own usage over time: the box and the `/cacheguard` table show how often your cache was lost after a similar pause.
-When a large chat's cache has expired, it is often cheaper to type `/new` and give the new chat the old session ID.
+When a large chat's cache has expired, it is often cheaper to type `/new`, then ask the new chat to read back the old session by its ID.
 
 How long a cache lives depends on the provider, the model and your Hermes config: from 5 minutes to several hours.
 See [Get more from your cache](docs/guide.md#get-more-from-your-cache).
@@ -15,17 +15,36 @@ See [Get more from your cache](docs/guide.md#get-more-from-your-cache).
 ## Scope
 
 - Works in: the terminal (CLI, TUI), the desktop app and Web UI, the gateway (Telegram and other messaging apps).
-- Left alone: anything that runs without you: cron, kanban, subagents, API server, webhooks, Bot Chat.
+- Tested: CLI, TUI, desktop app, Web UI and Telegram. Editor (ACP) and other gateway platforms should work but are not tested.
+- Editor (ACP): it cannot show the box, so `block` acts as `warn` there.
+- Left alone: anything that runs without you: cron, kanban, subagents, the curator, API server, webhooks, and Bot Chat when it runs as a one-shot (`-c NAME -Q`).
 
 ## Install
 
-Needs Hermes 0.22.3 or newer. 0.22.2 builds from after 2026-10-18 work too; older ones show no result lines.
+Needs Hermes 0.22.5 or newer.
 
     hermes plugins install https://github.com/AIverflow/hermes-cacheguard.git --enable
 
 Then [restart the gateway](#restart-the-gateway) and start a new chat.
 
 Another profile: add `-p <profile>` after `hermes` in every command here, and use `~/.hermes/profiles/<profile>/` instead of `~/.hermes/`.
+
+### Older Hermes
+
+Hermes refuses a cacheguard version that is too new for it. Pick the version that matches your Hermes:
+
+| cacheguard | Hermes | Git tag |
+|---|---|---|
+| 0.4.0 | 0.22.5 or newer | `v0.4.0` |
+| 0.3.0 | 0.22.3 or newer | `v0.3.0` |
+| 0.2.0 | 0.21.6 or newer | `v0.2.0` |
+
+Hermes installs an older version by its full commit ID, not by tag:
+
+    hermes plugins install https://github.com/AIverflow/hermes-cacheguard.git --ref c5a6380fc2754468f3b362608ddd0423045f1e35 --enable   # 0.3.0
+    hermes plugins install https://github.com/AIverflow/hermes-cacheguard.git --ref 51de851525bd3d31193154bf8407c67537b6f392 --enable   # 0.2.0
+
+Or with git: `git clone --branch v0.3.0 https://github.com/AIverflow/hermes-cacheguard.git ~/.hermes/plugins/cacheguard`. The plugin files of 0.2.0 still say 0.3.0 inside.
 
 ### Or with git
 
@@ -50,7 +69,7 @@ If a Hermes gateway runs, every chat runs its plugins inside it, even in the ter
 
 ## Quick setup
 
-Type `/cacheguard` to check. A new install says `(no observations yet)`. A `health: degraded` line means something is wrong. In a terminal, `hermes cacheguard` shows the same table.
+Type `/cacheguard` to check. A new install says `(no observations yet)`. A `health: degraded` line means something is wrong.
 
 Defaults: cli `warn`, desktop `warn`, gateway `off`. A pause is 10 minutes and a large prompt is 20k tokens.
 
@@ -68,6 +87,8 @@ To change only the pause, here to 1 minute:
 
     /cacheguard set pause_m 1
 
+Two limits count items, not days. Defaults: `journal_rows 10000` (most calls kept in the stats) and `chat_files 200` (most chats that keep a tracking file). Change one with `/cacheguard set journal_rows 5000`.
+
 ## Using it
 
 ### `block`: asks before sending
@@ -83,7 +104,9 @@ Example: with `pause_m 10` and `size_k 20`, you come back after 12 minutes to a 
       [CACHEGUARD] BLOCKED · message not sent after a pause of 12 minutes (cancelled)
       Send it again, or start /new and paste it. Session ID: <id>
 
-- **Send** (`Send message`, `Allow once`): the message is sent. Then one line says what happened:
+  After a timeout, the first line ends `after a pause of 12 minutes and 300s timeout`. After a model change it ends `message not sent (model changed)`.
+
+- **Send** (`Allow once`): the message is sent. Then one line says what happened:
   - The cache was lost:
 
         CGUARD cache lost, 48k rebilled, 12 min
@@ -126,6 +149,15 @@ Extra buttons: **Allow session** and **Always allow** just send. **Skip all this
 
 - cacheguard never calls the model itself, and nothing leaves your machine.
 - If the plugin fails at any point, your message is still sent. Only a Cancel you already gave stays not sent. If the box itself fails, or Hermes answers in a form cacheguard does not know, cacheguard only warns until Hermes restarts.
+
+## Disclosure
+
+- **No network, no subprocess, no model call in the plugin.** cacheguard only reads what Hermes passes to it.
+- **Reads:** your `config.yaml` (its own settings, and `approvals.timeout` for the box wait).
+- **Writes:** `<hermes home>/cacheguard/` (a journal of calls after a pause of 1 minute or more, with token counts and no session ID, and one small file per chat) and its own settings in `config.yaml` when you use `/cacheguard set` or `setup`.
+- **In the repo, not in the plugin:** `scripts/` and `.github/` hold the daily compatibility check. It runs on GitHub only, never in your Hermes, and sends a Telegram alert only if its owner sets a token.
+- **No message text is stored or logged.** Only counts, times, model names and a hash of the chat. The journal holds no session ID; only the chat's own small file is named after it.
+- **Private Hermes names:** the confirmation box (`block` mode) has no public Hermes API yet, so cacheguard uses a few private ones. `/cacheguard` health checks them, and `hermes plugins validate` lists them.
 
 ## Turn off or remove
 

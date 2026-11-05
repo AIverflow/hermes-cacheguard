@@ -31,8 +31,8 @@ def test_webui_cacheguard_table_is_fenced(webui):
     obs = webui.home.home / "cacheguard"
     obs.mkdir(exist_ok=True)
     now = time.time()
-    rows = [{"ts": now - 100 + i, "session_id": "seed", "model": "custom/fake-model", "api_mode": "chat_completions",
-             "api_request_id": f"seed-{i}", "gap_s": 400, "prompt_tokens": 30000, "cache_read_tokens": 1000,
+    rows = [{"ts": now - 100 + i, "model": "custom/fake-model", "api_mode": "chat_completions",
+             "gap_s": 400, "prompt_tokens": 30000, "cache_read_tokens": 1000,
              "cache_write_tokens": 0, "prev_prompt_tokens": 30000, "cause": None} for i in range(6)]
     (obs / "observations.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     out = webui.call("/api/commands/exec", {"command": "/cacheguard"})["output"]

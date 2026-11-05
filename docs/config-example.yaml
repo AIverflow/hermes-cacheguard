@@ -16,4 +16,6 @@ plugins:
         gateway: "off"             # Telegram and other messaging platforms: off | warn | block
         size_k: 20                 # only act on prompts at least this large, in thousands of tokens
         pause_m: 10                # idle minutes before a chat counts as paused (minimum 1)
+        journal_rows: 10000        # most calls kept in the stats (a count, not days; whole number, 1 or more)
+        chat_files: 200            # most chats that keep a tracking file, newest first (whole number, 1 or more)
         display_on_success: false  # show the result line when the cache was kept (loss and unknown always show)

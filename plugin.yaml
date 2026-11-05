@@ -1,9 +1,9 @@
 name: cacheguard
-version: "0.3.0"
-tested_hermes: "0.22.2+2233"
+version: "0.4.0"
+tested_hermes: "0.22.7"
 description: "Warns or asks before a large chat is sent after a pause, when the prompt cache may have expired, and shows how often the cache was lost."
 author: "AIverflow"
-requires_hermes: ">=0.22.2"
+requires_hermes: ">=0.22.5"
 config_schema:
   cli:
     type: str
@@ -23,6 +23,12 @@ config_schema:
   pause_m:
     type: number
     description: "Idle minutes that count as a pause. Number, 1 or more; default 10"
+  journal_rows:
+    type: number
+    description: "Most calls kept in the stats (a count, not days). Whole number, 1 or more; default 10000"
+  chat_files:
+    type: number
+    description: "Most chats that keep a tracking file, newest first. Whole number, 1 or more; default 200"
 provides_middleware:
   - llm_request
   - llm_execution
