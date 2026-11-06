@@ -143,12 +143,9 @@ def _health() -> dict[str, tuple[bool, str]]:
     check("middleware", lambda: listed("hermes_cli.middleware", "VALID_MIDDLEWARE", "llm_execution"))
     check("llm_request", lambda: listed("hermes_cli.middleware", "VALID_MIDDLEWARE", "llm_request"))
     check("transform_llm_output", lambda: listed("hermes_cli.plugins", "VALID_HOOKS", "transform_llm_output"))
-    check("gateway_approval", lambda: has(("tools.approval", "_gateway_notify_cb"),
-                                          ("tools.approval_gateway_wait", "_await_gateway_decision")))
+    check("pre_llm_call", lambda: listed("hermes_cli.plugins", "VALID_HOOKS", "pre_llm_call"))
     check("usage_api", lambda: has(("agent.usage_pricing", "normalize_usage")))
-    check("session_key", lambda: has(("tools.approval_context", "get_current_session_key")))
-    check("config_api", lambda: has(("hermes_cli.config", "read_raw_config_readonly"),
-                                    ("hermes_constants", "get_hermes_home")))
+    check("config_api", lambda: has(("hermes_constants", "get_hermes_home")))
     check("cron_execution", lambda: callable(getattr(config._CTX, "current_cron_execution", None)))
     check("single_query", lambda: has(("tools.approval_context", "_is_single_query_approval_context")))
     check("post_message", lambda: callable(getattr(config._CTX, "post_message", None)))
@@ -167,15 +164,13 @@ def _health() -> dict[str, tuple[bool, str]]:
 
 # One plain sentence per check, printed in the chat. The technical name and detail stay in
 # `/cacheguard` (health section) only.
-_NO_BOX_TEXT = "cacheguard cannot show the box here: it only warns."
 _HEALTH_EFFECTS = {
-    "gateway_approval": _NO_BOX_TEXT,
     "usage_api": "cacheguard cannot read cache numbers: results may be missing.",
-    "session_key": _NO_BOX_TEXT,
     "llm_request": "cacheguard lines may reach the model.",
     "transform_llm_output": "no result lines.",
+    "pre_llm_call": "cacheguard cannot block here: it only warns.",
     "cron_execution": "cacheguard may treat some cron runs as chats.",
-    "single_query": "with chat -q, cacheguard may ask where it should only warn.",
+    "single_query": "with chat -q, cacheguard may block where it should only warn.",
     "post_message": "cacheguard cannot show its lines in this Hermes.",
     "set_config": "cacheguard cannot save settings in this Hermes.",
     "middleware": "cacheguard is off: it could not start.",
@@ -194,9 +189,6 @@ def _health_text() -> str:
            for k, (ok, d) in _H["checks"].items() if not ok]
     bad.extend(f"config: {reason}" for reason in sorted(_H["config_errors"]))
     bad.extend(f"data: {reason}" for reason in sorted(_H["data_errors"]))
-    if _H.get("box_failed"):
-        bad.append("The cacheguard box failed this session, so it is off until Hermes restarts: "
-                   f"block acts as warn. ({_H['box_failed']})")
     if not bad:
         return ""
     return "\n".join(["health: degraded"] + [f"  - {b}" for b in bad])

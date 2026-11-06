@@ -1,15 +1,17 @@
-"""Installed Hermes contract on an isolated gateway copy and local transports."""
+"""Live checks against the installed Hermes: its plugin loader, and a block then /retry through its gateway runner."""
 import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PAD = ' x' * 300  # about 150 tokens: over the test size threshold
 HERMES = Path(os.environ['HERMES_AGENT_DIR']) if os.environ.get('HERMES_AGENT_DIR') else Path.home() / '.hermes' / 'hermes-agent'
 
 
-def test_installed_gateway_hold_send_deny(tmp_path):
+def test_installed_plugin_contract(tmp_path):
     import pytest
     direct = bool(os.environ.get('HERMES_PYTHON') and os.environ.get('HERMES_AGENT_DIR'))  # CI: source checkout
     launcher = shutil.which('hermes')
@@ -39,15 +41,80 @@ def test_installed_gateway_hold_send_deny(tmp_path):
     except subprocess.TimeoutExpired as exc:
         pytest.fail(str(exc.stdout) + str(exc.stderr))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert 'GATEWAY HOLD/SEND/DENY VERIFIED' in result.stdout
+    assert 'PLUGIN CONTRACT VERIFIED' in result.stdout
     assert 'INSTALLED VALIDATE/DOCTOR VERIFIED' in result.stdout
     assert 'INSTALLED THREE USAGE MODES VERIFIED' in result.stdout
 
 
-def run_gateway_contract():
+def test_gateway_block_then_retry_or_resend(hermes_python, make_hermes_home, fake_provider):
+    """Real gateway runner, real agent, fake provider: a blocked message never reaches the provider,
+    /retry or the same text again sends it once, and the sent request carries no BLOCKED text."""
+    from e2e_support import RUNNER
+    home = make_hermes_home(gateway="block")
+    result = subprocess.run([hermes_python, "-I", str(RUNNER), "script", str(Path(__file__).resolve()), "retry"],
+                            env=home.env(GATEWAY_ALLOW_ALL_USERS="true"), text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RETRY SCENARIO VERIFIED" in result.stdout, result.stdout + result.stderr
+    # The model requests, in order (the title request is another conversation). A blocked message
+    # makes no request, so each of the three messages shows up exactly once, as typed.
+    chats = [r["messages"] for r in fake_provider.requests if "name chat sessions" not in r["messages"][0]["content"]]
+    users = [[m["content"] for m in msgs if m["role"] == "user"] for msgs in chats]
+    sent = [u[-1] for u in users]
+    assert sent[0].startswith("first" + PAD) and sent[1:] == ["second" + PAD, "third" + PAD], [t[:20] for t in sent]  # a first turn gets a hint added
+    assert [len(u) for u in users] == [1, 2, 3]
+    for msgs in chats:
+        assert not any("CACHEGUARD" in str(m["content"]) or "withheld" in str(m["content"]) for m in msgs[1:])
+
+
+def run_retry_scenario():
+    """Runs inside the installed Hermes Python: the gateway runner takes messages from one chat."""
     import asyncio
+    from types import SimpleNamespace
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from e2e_support import age_sessions
+    from gateway.config import GatewayConfig, Platform
+    from gateway.platforms.event import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    class LocalAdapter:
+        typed_command_prefix = '/'
+        def pause_typing_for_chat(self, chat_id):
+            pass
+        def resume_typing_for_chat(self, chat_id):
+            pass
+        def get_pending_message(self, session_key):
+            return None
+        async def send(self, chat_id, content, **kw):
+            return SimpleNamespace(success=True, message_id='local')
+
+    async def scenario():
+        home = Path(os.environ['HERMES_HOME'])
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters[Platform.TELEGRAM] = LocalAdapter()
+        origin = SessionSource(platform=Platform.TELEGRAM, chat_id='chat', user_id='owner')
+
+        async def say(text):
+            return await runner._handle_message(MessageEvent(text=text, source=origin, message_id='m'))
+
+        async def after_pause(text):  # the cache lifetime is over: a large message is blocked
+            age_sessions(home)
+            return await say(text)
+
+        assert await say('first' + PAD) == 'pong'
+        blocked = await after_pause('second' + PAD)
+        assert blocked.startswith('[CACHEGUARD] BLOCKED · ') and '/retry' in blocked, blocked
+        assert await say('/retry') == 'pong'
+        assert (await after_pause('third' + PAD)).startswith('[CACHEGUARD] BLOCKED · ')
+        assert await say('third' + PAD) == 'pong'
+        print('RETRY SCENARIO VERIFIED')
+
+    asyncio.run(scenario())
+
+
+def run_plugin_contract():
     import socket
-    import sys
     import tempfile
     import time
     from types import SimpleNamespace
@@ -58,33 +125,19 @@ def run_gateway_contract():
     socket.socket.connect = no_network
     socket.socket.connect_ex = no_network
 
-    # Only the gateway source is copied; installed libraries/agent source stay read-only.
     with tempfile.TemporaryDirectory(prefix='cacheguard-gateway-') as workspace:
         workspace = Path(workspace)
-        source = workspace / 'source'
-        source.mkdir()
-        shutil.copytree(HERMES / 'gateway', source / 'gateway', ignore=shutil.ignore_patterns('__pycache__'))
-        sys.path.insert(0, str(source))
         plugin_dir = workspace / 'plugin'
         plugin_dir.mkdir()
         for name in (*sorted(f.name for f in ROOT.glob('*.py')), 'plugin.yaml', 'README.md', 'LICENSE'):
             if (ROOT / name).exists():
                 shutil.copy2(ROOT / name, plugin_dir / name)
         home = Path(os.environ['HERMES_HOME'])
-        (home/'config.yaml').write_text('plugins:\n  entries:\n    cacheguard:\n      settings:\n        cli: block\n        gateway: block\n        display_on_success: true\n        pause_m: 5\n        size_k: 20\napprovals:\n  timeout: 5\n')
+        (home/'config.yaml').write_text('plugins:\n  entries:\n    cacheguard:\n      settings:\n        cli: block\n        gateway: block\n        display_on_success: true\n        pause_m: 5\n        size_k: 20\n')
 
-        from agent.turn_api_call import perform_api_call
-        from gateway.config import GatewayConfig, Platform
-        from gateway.platforms.event import MessageEvent
-        from gateway.run import GatewayRunner
-        from gateway.run_turn_runner import TurnRunner
-        from gateway.session import SessionSource
-        from gateway.turn_context import TurnContext
-        from hermes_cli.middleware import apply_llm_request_middleware
         from hermes_cli.plugin_dev import doctor_plugin
         from hermes_cli.plugin_validate import validate_plugin_dir
         from hermes_cli.plugins import get_plugin_manager
-        from tools.approval import has_blocking_approval
         probe_env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
         validation = validate_plugin_dir(plugin_dir, probe=([sys.executable], probe_env))
         assert validation.ok, validation.failures
@@ -92,7 +145,6 @@ def run_gateway_contract():
         assert doctor.ok, doctor.format_text()
         print('INSTALLED VALIDATE/DOCTOR VERIFIED')
 
-        assert Path(sys.modules['gateway.run'].__file__).is_relative_to(source)
         manager = get_plugin_manager()
         manifests = manager._scan_directory(workspace, source="user")
         assert len(manifests) == 1
@@ -107,118 +159,6 @@ def run_gateway_contract():
                 plugin.storage._write_json_atomic(plugin.storage._session_file(sid), record)
         manager._discovered = True
 
-        class LocalAdapter:
-            typed_command_prefix = '/'
-            def __init__(self):
-                self.messages = []
-                self.ready = asyncio.Event()
-            def pause_typing_for_chat(self, chat_id):
-                pass
-            def resume_typing_for_chat(self, chat_id):
-                pass
-            async def send(self, chat_id, content, **kw):
-                self.messages.append(content)
-                self.ready.set()
-                return SimpleNamespace(success=True, message_id='local')
-
-        class LocalProviderAgent:
-            _disable_streaming = True
-            _model_request_active = None
-            _pending_redirect_lock = None
-            api_mode = 'chat_completions'
-            base_url = 'http://fake.invalid'
-            provider = 'local'
-            model = 'fixture'
-            platform = 'telegram'
-            thinking_callback = None
-            def __init__(self, sid):
-                self.session_id = sid
-                self.calls = 0
-                self.requests = []
-            def _has_pending_redirect(self):
-                return False
-            def _interruptible_api_call(self, request):
-                self.calls += 1
-                self.requests.append(request)
-                return SimpleNamespace(usage={'prompt_tokens': 30000,
-                                              'prompt_tokens_details': {'cached_tokens': 29000}})
-            def run_conversation(self, message, history=(), pad=120000, **kwargs):
-                request = {'messages': [*history, {'role': 'user', 'content': message + 'x'*pad}]}
-                # The real agent runs this middleware just before the provider call.
-                request = apply_llm_request_middleware(request, session_id=self.session_id, platform=self.platform,
-                        model=self.model, provider=self.provider, base_url=self.base_url, api_mode=self.api_mode,
-                        api_call_count=1).payload
-                result = perform_api_call(self, api_kwargs=request, _original_api_kwargs=request,
-                        _llm_middleware_trace=[], _moa_prepared_request=None,
-                        _retry=SimpleNamespace(), thinking_spinner=None, retry_count=0,
-                        api_call_count=1, api_request_id='fixture', effective_task_id='',
-                        turn_id='', interrupted=False)
-                return result.response
-
-        async def check():
-            runner = GatewayRunner(GatewayConfig())
-            adapter = LocalAdapter()
-            runner.adapters[Platform.TELEGRAM] = adapter
-            for choice in ('once', 'deny', 'timeout'):
-                sid = 'fixture-' + choice
-                origin = SessionSource(platform=Platform.TELEGRAM, chat_id=sid, user_id='owner')
-                key = runner._session_key_for_source(origin)
-                put_session(plugin, sid, {'last_api_ts': time.time()-3600, 'model': 'local/fixture',
-                                          'api_mode': 'chat_completions', 'prompt_tokens': 30000})
-                adapter.ready.clear()
-                rows_before = len(plugin.storage._load_observations())  # rows carry no session ID
-                ctx = TurnContext(source=origin, session_id=sid, session_key=key,
-                                  message='fixture', _status_adapter=adapter, _status_chat_id=sid,
-                                  _loop_for_step=asyncio.get_running_loop(), _run_still_current=lambda: True)
-                turn = TurnRunner(runner, ctx)
-                agent = LocalProviderAgent(sid)
-                # Use the actual gateway worker and context propagation.
-                task = asyncio.create_task(runner._run_in_executor_with_context(turn._run_conversation_with_approval,
-                    agent, [], [], None, None))
-                async with asyncio.timeout(5):
-                    while not adapter.ready.is_set():
-                        await asyncio.sleep(0.01)
-                assert not task.done() and agent.calls == 0 and has_blocking_approval(key)
-                assert 'cacheguard' in adapter.messages[-1] and '/approve' in adapter.messages[-1]
-                command = '/approve' if choice == 'once' else '/deny'
-                event = MessageEvent(text=command, source=origin, message_id='decision')
-                if choice == 'once':
-                    await runner._handle_approve_command(event)
-                elif choice == 'deny':
-                    await runner._handle_deny_command(event)
-                async with asyncio.timeout(8):
-                    while not task.done():
-                        await asyncio.sleep(0.01)
-                result = task.result()
-                rows = plugin.storage._load_observations()[rows_before:]
-                if choice == 'once':
-                    assert agent.calls == 1 and len(rows) == 1 and rows[0]['prompt_tokens'] == 30000
-                    # Real Hermes hook dispatch from the gateway worker, bound to this chat: the
-                    # reply stays the plain model reply and the cacheguard line is posted as its
-                    # own chat message through ctx.post_message (adapter.send).
-                    import gateway.run as gateway_run
-                    from agent.turn_finalizer import apply_llm_output_transform
-                    from gateway.plugin_messages import bind_live_source
-                    from gateway.session_context import scoped_session_key
-                    runner._running = True
-                    runner._gateway_loop = asyncio.get_running_loop()
-                    gateway_run._gateway_runner_ref = lambda: runner
-                    adapter.messages.clear()
-                    def finish_turn(key=key, origin=origin, sid=sid):
-                        with scoped_session_key(key), bind_live_source(origin):
-                            return apply_llm_output_transform(
-                                SimpleNamespace(session_id=sid, model='fixture', platform='telegram'),
-                                'Hello', turn_id='contract-turn')
-                    final, transformed, original = await runner._run_in_executor_with_context(finish_turn)
-                    assert final == 'Hello' and not transformed and original is None, (final, transformed)
-                    # One-off notices from earlier checks in this process may be posted first.
-                    notice = adapter.messages[-1]
-                    assert notice.startswith('CGUARD ') and '[CACHEGUARD]' not in notice, notice
-                    assert 'unknown' in notice or 'reused' in notice or 'lost' in notice, notice
-                else:
-                    assert agent.calls == 0 and rows == [] and 'message not sent' in result.choices[0].message.content
-                assert not has_blocking_approval(key)
-            runner._shutdown_executor(drain_timeout=1.0)
         for mode, raw in (
             ('chat_completions', {'prompt_tokens': 30000, 'prompt_tokens_details': {'cached_tokens': 29000}}),
             ('anthropic_messages', {'input_tokens': 1000, 'cache_read_input_tokens': 29000}),
@@ -254,7 +194,6 @@ def run_gateway_contract():
         assert len(plugin.storage._load_observations()) == rows_before  # detached calls write no row
         print('INSTALLED DETACHED TASK ISOLATION VERIFIED')
 
-        asyncio.run(check())
         manager.unload()
         manager._load_plugin(manifests[0])
         plugin = manager._plugins[manifests[0].key or manifests[0].name].module
@@ -275,8 +214,8 @@ def run_gateway_contract():
         assert (home / 'config.yaml').read_bytes() == before
         manager.unload()
         print('INSTALLED SETUP PERSISTENCE VERIFIED')
-        print('GATEWAY HOLD/SEND/DENY VERIFIED')
+        print('PLUGIN CONTRACT VERIFIED')
 
 
 if __name__ == '__main__':
-    run_gateway_contract()
+    {'retry': run_retry_scenario}.get(sys.argv[1] if len(sys.argv) > 1 else '', run_plugin_contract)()

@@ -1,9 +1,9 @@
-"""cacheguard — warn or ask before sending a large context after a pause.
+"""cacheguard — warn or block before sending a large context after a pause.
 
 The first API call of each turn is guarded using context-size and idle-time
-thresholds. Cache availability is unknown before the provider call; the box
+thresholds. Cache availability is unknown before the provider call; the block text
 shows only how often the cache was lost after similar pauses before. In block mode,
-deny or timeout ends the turn without calling the provider.
+the pre_llm_call hook stops the message; the user sends it with /retry or sends it again.
 
 Works in the Hermes CLI and in the gateway.
 Bot Chat is left alone when it runs as a one-shot (`-c NAME -Q`). In a messaging chat it is a normal gateway chat.
@@ -45,6 +45,10 @@ def register(ctx: Any) -> None:
         ctx.register_hook("transform_llm_output", guard._transform_llm_output)
     except Exception as exc:
         health._H["checks"]["transform_llm_output"] = (False, f"{type(exc).__name__}: {exc}")
+    try:
+        ctx.register_hook("pre_llm_call", guard._on_pre_llm_call)
+    except Exception as exc:
+        health._H["checks"]["pre_llm_call"] = (False, f"{type(exc).__name__}: {exc}")
     try:
         ctx.register_command(
             "cacheguard",

@@ -54,7 +54,7 @@ def test_unbounded_config_number_falls_back_without_raising(env):
 def test_defaults_keys_are_frozen(env):
     # A new setting needs the maintainer's explicit OK (AGENTS.md): change this list only when asked.
     assert sorted(env.plugin.DEFAULTS) == sorted([
-        "cli", "desktop", "gateway", "display_on_success", "size_k", "pause_m", "journal_rows", "chat_files"])
+        "cli", "desktop", "gateway", "display_on_success", "block_images", "tiny_block", "size_k", "pause_m", "journal_rows", "chat_files"])
 
 
 @pytest.mark.parametrize("bad", [0, -5, 2.5, "many", True, "10000"])
@@ -72,6 +72,19 @@ def test_cfg_asks_hermes_for_each_setting_by_name(env):
     env.plugin._CTX = types.SimpleNamespace(get_config=lambda key, default=None: (asked.append(key), ctx.get_config(key, default))[1])
     assert env.plugin._cfg()["cli"] == "block"
     assert sorted(asked) == sorted(env.plugin.DEFAULTS)
+
+
+@pytest.mark.parametrize("bad", ["yes", 1])
+def test_bad_block_images_value_acts_as_false_and_is_reported(env, bad):
+    env.config["block_images"] = bad
+    assert env.plugin._cfg()["block_images"] is False
+    assert "invalid block_images; using default" in env.plugin._H["config_errors"]
+
+
+def test_block_images_is_off_by_default_and_can_be_on(env):
+    assert env.plugin._cfg()["block_images"] is False
+    env.config["block_images"] = True
+    assert env.plugin._cfg()["block_images"] is True
 
 
 @pytest.mark.parametrize("bad", ["yes", 1])
@@ -125,3 +138,16 @@ def test_unquoted_yaml_off_means_off(env):
     cfg = env.plugin._cfg()
     assert [cfg[k] for k in ('cli', 'desktop', 'gateway')] == ['off'] * 3
     assert not env.plugin._H['config_errors']
+
+
+@pytest.mark.parametrize("bad", ["yes", 1, None, "on"])
+def test_bad_tiny_block_value_acts_as_false_and_is_reported(env, bad):
+    env.config["tiny_block"] = bad
+    assert env.plugin._cfg()["tiny_block"] is False
+    assert "invalid tiny_block; using default" in env.plugin._H["config_errors"]
+
+
+def test_tiny_block_is_off_by_default_and_can_be_on(env):
+    assert env.plugin._cfg()["tiny_block"] is False
+    env.config["tiny_block"] = True
+    assert env.plugin._cfg()["tiny_block"] is True

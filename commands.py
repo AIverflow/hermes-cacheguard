@@ -18,7 +18,9 @@ _SET_USAGE = (
     "  size_k        number (in k)     alert from this prompt size, e.g. 30 = 30k (max 2000)\n"
     "  journal_rows  whole number >= 1  most calls kept in the stats (default 10000)\n"
     "  chat_files    whole number >= 1  most chats that keep a tracking file (default 200)\n"
-    "  display_on_success  on | off    show the result line when the cache was kept (default off)"
+    "  display_on_success  on | off    show the result line when the cache was kept (default off)\n"
+    "  block_images  on | off          also block a message with an image; attach it again to send (default off)\n"
+    "  tiny_block    on | off          one short BLOCKED line instead of three (default off)"
 )
 
 
@@ -62,9 +64,9 @@ def _parse_setting(name: str, raw: str) -> tuple[tuple[str, Any, str] | None, st
         if raw not in allowed:
             return None, f"cacheguard: {name} must be one of {', '.join(allowed)}."
         return (name, raw, raw), ""
-    if name == "display_on_success":
+    if name in ("display_on_success", "block_images", "tiny_block"):
         if raw not in ("on", "off"):
-            return None, "cacheguard: display_on_success must be on or off."
+            return None, f"cacheguard: {name} must be on or off."
         return (name, raw == "on", raw), ""
     if name in ("pause_m", "size_k"):
         try:

@@ -202,7 +202,7 @@ def test_set_writes_through_the_context(env, monkeypatch):
 
 def test_summary_shows_health_only_when_degraded(env):
     assert "health:" not in env.plugin._cmd_show()
-    env.plugin._H["checks"]["gateway_approval"] = (False, "missing or changed")
+    env.plugin._H["checks"]["usage_api"] = (False, "missing or changed")
     assert "health: degraded" in env.plugin._cmd_show()
 
 
@@ -247,7 +247,7 @@ def test_help_covers_every_subcommand_handled_by_show(env):
 
 
 def test_help_lists_every_set_name(env):
-    samples = {"cli": "block", "desktop": "block", "display_on_success": "on", "gateway": "block",
+    samples = {"cli": "block", "desktop": "block", "display_on_success": "on", "block_images": "on", "tiny_block": "on", "gateway": "block",
                "pause_m": "5", "size_k": "30", "journal_rows": "5000", "chat_files": "50"}
     for name, raw in samples.items():
         assert env.plugin._parse_setting(name, raw)[0] is not None
@@ -341,6 +341,22 @@ def test_set_display_on_success_is_saved(env, monkeypatch):
     saved = _fake_settings_writer(env)
     env.plugin._cmd_show("set display_on_success on")
     assert saved == [("display_on_success", True)]
+
+
+def test_set_tiny_block_is_saved(env):
+    ctx = _with_ctx(env)
+    assert "saved" in env.plugin._cmd_show("set tiny_block on")
+    assert "saved" in env.plugin._cmd_show("set tiny_block off")
+    assert ctx.calls == [("tiny_block", True), ("tiny_block", False)]
+    assert env.plugin._cmd_show("set tiny_block maybe").startswith("cacheguard: tiny_block must be on or off.")
+
+
+def test_set_block_images_is_saved(env):
+    ctx = _with_ctx(env)
+    assert "saved" in env.plugin._cmd_show("set block_images on")
+    assert "saved" in env.plugin._cmd_show("set block_images off")
+    assert ctx.calls == [("block_images", True), ("block_images", False)]
+    assert env.plugin._cmd_show("set block_images maybe").startswith("cacheguard: block_images must be on or off.")
 
 
 def test_set_display_on_success_refuses_true(env):

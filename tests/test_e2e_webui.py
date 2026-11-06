@@ -45,18 +45,25 @@ def test_webui_cacheguard_table_is_fenced(webui):
     assert not any("fake-model" in line for line in lines[:start] + lines[end + 1:]), out
 
 
-def test_webui_block_deny_shows_blocked(webui):
+def test_webui_block_shows_blocked_then_resend_sends(webui, fake_provider):
     sid = webui.call("/api/session/new", {})["session"]["session_id"]
 
     def messages():
         return webui.call("/api/session?session_id=" + sid)["session"].get("messages") or []
 
+    def texts(role):
+        return [str(m.get("content")) for m in messages() if m["role"] == role]
+
     webui.call("/api/chat/start", {"session_id": sid, "message": "hello"})
-    _until(lambda: any(m["role"] == "assistant" for m in messages()), "first reply")
+    _until(lambda: texts("assistant"), "first reply")
     webui.home.age_sessions()  # the pause is at least 1 minute: make the first call look 2 minutes old
     _until(lambda: _start(webui, sid, "second"), "second turn accepted")  # 409 while the first turn ends
-    pending = _until(lambda: webui.call("/api/approval/pending?session_id=" + sid).get("pending"), "approval")
-    assert "[CACHEGUARD]" in pending["command"]
-    webui.call("/api/approval/respond", {"session_id": sid, "choice": "deny", "approval_id": pending["approval_id"]})
-    blocked = _until(lambda: [m for m in messages() if "BLOCKED" in str(m.get("content"))], "BLOCKED reply")
-    assert "message not sent" in blocked[-1]["content"]
+    _until(lambda: any("BLOCKED" in t for t in texts("assistant")), "BLOCKED reply")
+    assert not any("second" in str(r["messages"][-1]["content"]) for r in fake_provider.requests)  # not sent
+
+    # The web UI's own /retry endpoint hands back the placeholder Hermes stores for a blocked
+    # message, not the typed text: so the same text is sent again by hand.
+    _until(lambda: _start(webui, sid, "second"), "resend accepted")
+    _until(lambda: texts("assistant")[-1:] == ["pong"], "reply after resend")
+    sent = [r["messages"] for r in fake_provider.requests if "second" in str(r["messages"][-1]["content"])]
+    assert len(sent) == 1 and not any("CACHEGUARD" in str(m["content"]) for m in sent[0])

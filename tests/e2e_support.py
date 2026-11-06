@@ -10,8 +10,6 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = Path(__file__).resolve().parent / "e2e_runner.py"
 AGENT_DIR = Path(os.environ.get("HERMES_AGENT_DIR") or Path.home() / ".hermes" / "hermes-agent")
@@ -29,6 +27,7 @@ def free_port():
 
 def hermes_python():
     """Interpreter of the installed Hermes, or skip."""
+    import pytest
     if DIRECT:
         if not (AGENT_DIR.exists() and Path(os.environ["HERMES_PYTHON"]).is_file()):
             pytest.skip("HERMES_PYTHON or HERMES_AGENT_DIR does not exist")
@@ -50,6 +49,18 @@ def hermes_python():
         return str(python)
     except Exception as exc:  # noqa: BLE001
         pytest.skip(f"cannot find the Hermes Python: {exc}")
+
+
+def age_sessions(home, seconds=120):
+    """Make every saved chat in this Hermes home look `seconds` older, so the next call comes after a real pause."""
+    for path in (home / "cacheguard" / "sessions").glob("*.json"):
+        rec = json.loads(path.read_text())
+        for key in ("last_api_ts", "cache_touch_ts"):
+            if isinstance(rec.get(key), (int, float)):
+                rec[key] -= seconds
+        if isinstance(rec.get("guard_sends"), dict):  # the cooldown after a sent message
+            rec["guard_sends"] = {k: v - seconds for k, v in rec["guard_sends"].items()}
+        path.write_text(json.dumps(rec))
 
 
 class FakeProvider:
@@ -152,13 +163,7 @@ class HermesHome:
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
     def age_sessions(self, seconds=120):
-        """Make every saved chat look `seconds` older, so the next call comes after a real pause."""
-        for path in (self.home / "cacheguard" / "sessions").glob("*.json"):
-            rec = json.loads(path.read_text())
-            for key in ("last_api_ts", "cache_touch_ts"):
-                if isinstance(rec.get(key), (int, float)):
-                    rec[key] -= seconds
-            path.write_text(json.dumps(rec))
+        age_sessions(self.home, seconds)
 
     def gateway_pids(self):
         """PIDs of the processes running with this home as HERMES_HOME.
@@ -227,6 +232,8 @@ class WebUI:
     def __init__(self, python, hermes_home):
         import time
         import urllib.request
+
+        import pytest
         if WEBUI_DIR is None or not (WEBUI_DIR / "server.py").exists():
             pytest.skip("hermes-webui not installed or HERMES_WEBUI_DIR unset")
         self.port = free_port()
@@ -235,7 +242,7 @@ class WebUI:
             HERMES_WEBUI_HOST="127.0.0.1", HERMES_WEBUI_PORT=str(self.port), HERMES_WEBUI_AGENT_DIR=str(AGENT_DIR),
             HERMES_WEBUI_STATE_DIR=str(hermes_home.root / "webui-state"), HERMES_WEBUI_PASSWORD="")
         self.log = open(hermes_home.root / "webui.log", "w")
-        self.proc = subprocess.Popen([python, "-I", str(RUNNER), "web", str(WEBUI_DIR / "server.py")], env=env,
+        self.proc = subprocess.Popen([python, "-I", str(RUNNER), "script", str(WEBUI_DIR / "server.py")], env=env,
                                      stdout=self.log, stderr=subprocess.STDOUT)
         deadline = time.time() + 30
         while time.time() < deadline:

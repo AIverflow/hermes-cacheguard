@@ -1,15 +1,11 @@
 """Tests of guard.py: the middleware, result lines, history cleaning, prefix hash."""
-import copy
 import json
-import sys
 import time
 import types
 
 import pytest
 from conftest import (
-    _box_broke_notices,
     _cold_history,
-    _journal_row,
     _run_counting,
     big_request,
     put_session,
@@ -45,31 +41,22 @@ def test_gateway_default_off_still_records_usage(env):
 
 @pytest.mark.parametrize("platform,setting", [("cli", "cli"), ("telegram", "gateway")])
 @pytest.mark.parametrize("mode", ["off", "warn", "block"])
-def test_surface_modes_gate_idle_trigger(env, monkeypatch, platform, setting, mode):
+def test_surface_modes_gate_idle_trigger(env, platform, setting, mode):
+    # The middleware never blocks: block is the pre_llm_call hook's job, so it only warns here.
     env.config.update({setting: mode, "size_k": 1})
     seed_session(env, ago=3600)
-    if mode == "block" and platform == "cli":
-        monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
-        env.approval = lambda *a, **k: "deny"
-    if mode == "block" and platform != "cli":
-        monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-        monkeypatch.setattr(env.plugin, "_gateway_confirmation", lambda *a: object())
     out, called, sentinel = run_middleware(env, platform=platform)
+    assert called and out is sentinel
     if mode == "off":
-        assert called and out is sentinel and env.warned() is None
-    elif mode == "warn":
-        assert called and out is sentinel
-    elif platform == "cli":
-        assert not called and "message not sent" in out.choices[0].message.content
+        assert env.warned() is None
     else:
-        assert not called
+        assert env.warned() is not None
 
 
 @pytest.mark.parametrize("mode", ["warn", "block"])
 def test_bot_chat_like_quiet_call_is_pure_pass_through(env, mode):
     # Bot Chat runs as `-c NAME -Q`: minted task id, so it is a background call.
     env.config.update(cli=mode, gateway=mode, size_k=1)
-    env.approval = lambda *a, **k: pytest.fail("a quiet call must never prompt")
     seed_session(env, ago=3600)
     before = env.plugin._read_session("s1")
     out, called, sentinel = run_middleware(env, task_id=MINTED, model="new")
@@ -87,40 +74,6 @@ def test_gateway_warn_mode_is_nonblocking(env, trigger):
         seed_session(env, ago=10, model="p/old")
     out, called, sentinel = run_middleware(env, platform="telegram", model="new")
     assert called and out is sentinel and env.warned() is not None
-
-
-@pytest.mark.parametrize("trigger", ["idle", "model_change"])
-def test_gateway_block_mode_retains_approval_for_both_triggers(env, monkeypatch, trigger):
-    env.config.update(gateway="block", cli="off")
-    if trigger == "idle":
-        seed_session(env, ago=3600)
-    else:
-        seed_session(env, ago=10, model="p/old")
-    blocked = object()
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-    asked = []
-    monkeypatch.setattr(env.plugin, "_gateway_confirmation", lambda *a: (asked.append(a[1]), blocked)[1])
-    out, called, _ = run_middleware(env, platform="telegram", model="new")
-    assert out is blocked and not called
-    assert "\n\n" in asked[0]  # chat apps keep the blank line under the title
-
-
-@pytest.mark.parametrize("trigger", ["idle", "model_change"])
-def test_tui_block_uses_gateway_approval(env, monkeypatch, trigger):
-    # Terminal chats ask through the gateway approval queue.
-    env.config.update(cli="block", size_k=1)
-    if trigger == "idle":
-        seed_session(env, ago=3600)
-    else:
-        seed_session(env, ago=10, model="p/old")
-    monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
-    blocked = object()
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-    asked = []
-    monkeypatch.setattr(env.plugin, "_gateway_confirmation", lambda *a: (asked.append(a[1]), blocked)[1])
-    out, called, _ = run_middleware(env, platform="tui", model="new")
-    assert out is blocked and not called
-    assert "\n\n" not in asked[0]  # no blank line under the title in a terminal box
 
 
 MINTED = "3f2b8c1e-7a4d-4e6b-9c1a-0d5e2f8a1b34"  # Hermes mints a uuid4 when run_conversation gets no task_id
@@ -148,38 +101,12 @@ def test_named_task_id_stays_auxiliary(env, task):
 
 
 @pytest.mark.parametrize("trigger", ["idle", "model_change"])
-def test_single_query_block_warns_without_waiting_for_a_prompt(env, monkeypatch, trigger):
-    # `chat -q` has no screen: a prompt would wait out the timeout.
-    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
-    env.config.update(cli="block", size_k=1)
-    if trigger == "idle":
-        seed_session(env, ago=3600)
-    else:
-        seed_session(env, ago=10, model="p/old")
-    monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
-    env.approval = lambda *a, **k: pytest.fail("single-query must not prompt")
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: pytest.fail("single-query must not prompt"))
-    out, called, sentinel = run_middleware(env, model="new")
-    assert called and out is sentinel and env.warned() is not None
-
-
-def test_tui_block_without_any_approval_path_falls_back_to_warn(env, monkeypatch):
-    env.config.update(cli="block", size_k=1)
-    seed_session(env, ago=3600)
-    monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: None)
-    out, called, sentinel = run_middleware(env, platform="tui")
-    assert called and out is sentinel and env.warned() is not None
-
-
-@pytest.mark.parametrize("trigger", ["idle", "model_change"])
 def test_surface_off_cannot_be_reenabled_by_model_change(env, trigger):
     env.config.update(gateway="off", cli="block")
     if trigger == "idle":
         seed_session(env, ago=3600)
     else:
         seed_session(env, ago=10, model="p/old")
-    env.approval = lambda *a, **k: pytest.fail("surface off must never prompt")
     out, called, sentinel = run_middleware(env, platform="telegram", model="new")
     assert called and out is sentinel and env.warned() is None
 
@@ -201,15 +128,6 @@ def test_no_trigger(env, case):
     assert env.warned() is None
 
 
-def test_last_real_prompt_tokens_raise_floor(env):
-    seed_session(env, ago=3600, prompt_tokens=100000)
-    env.config["cli"] = "block"
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
-    run_middleware(env, request={"messages": [], "tools": []})
-    assert "100,000" in prompts[0]
-
-
 # ----------------------------------------------------------- model change --
 
 
@@ -217,16 +135,12 @@ def test_last_real_prompt_tokens_raise_floor(env):
 def test_model_change_off_warn_block(env, mode):
     seed_session(env, ago=10, model="p/old")  # short gap: only model-change can fire
     env.config["cli"] = mode
-    env.approval = lambda *a, **k: "deny"
     out, called, sentinel = run_middleware(env, model="new")
-    if mode == "block":
-        assert not called and "message not sent" in out.choices[0].message.content
+    assert called and out is sentinel  # block is the pre_llm_call hook's job: here it only warns
+    if mode == "off":
+        assert env.warned() is None
     else:
-        assert called and out is sentinel
-        if mode == "warn":
-            assert "model changed" in env.warned()
-        else:
-            assert env.warned() is None
+        assert "model changed" in env.warned()
 
 
 def test_model_change_same_model_silent(env):
@@ -241,256 +155,29 @@ def test_model_change_small_context_silent(env):
     assert env.warned() is None
 
 
-def _block_setup(env, answer):
+# ------------------------------------------------------- plugin errors --
+
+
+def test_error_in_the_check_sends_once(env, monkeypatch):
     env.config["cli"] = "block"
     seed_session(env, ago=3600)
-    calls = []
-
-    def cb(command, desc, **kw):
-        calls.append((command, desc, kw))
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-    env.approval = cb
-    return calls
-
-
-# ------------------------------------------------------------------ block --
-
-
-def test_block_deny_ends_turn(env):
-    calls = _block_setup(env, "deny")
-    out, called, _ = run_middleware(env)
-    assert not called
-    assert "message not sent" in out.choices[0].message.content
-    assert out.choices[0].finish_reason == "stop" and out.usage is None
-    assert calls[0][2] == {"allow_permanent": False, "allow_session": False}
-    assert env.warned() is None  # panel carried the info
-
-
-@pytest.mark.parametrize("answer", ["once", "session", "always"])
-def test_block_other_answers_send(env, answer):
-    _block_setup(env, answer)
-    out, called, sentinel = run_middleware(env)
-    assert called and out is sentinel
-
-
-def test_block_timeout_denies(env):
-    _block_setup(env, "timeout")
-    out, called, _ = run_middleware(env)
-    assert not called and "message not sent" in out.choices[0].message.content
-
-
-def test_repeated_denial_still_prompts_for_plugin_tracked_session(env):
-    env.config.update(cli="block", size_k=1)
-    seed_session(env, ago=7200)
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
-    for _ in range(2):
-        out, called, _ = run_middleware(env)
-        assert not called and "message not sent" in out.choices[0].message.content
-    assert len(prompts) == 2
-
-
-def _crash_after_denied(env, monkeypatch, outcome="cancelled"):
-    env.config["cli"] = "block"
-    seed_session(env, ago=3600)
-
-    def act(kwargs, mode, warn_note, command, deny, model, box=None):
-        box["shown"] = True
-        box["denied"] = outcome
-        raise RuntimeError("after the answer")
-
-    monkeypatch.setattr(env.plugin, "_act", act)
-
-
-def test_block_callback_raises_sends_and_switches_the_box_off(env):
-    _block_setup(env, RuntimeError("boom"))
-    out, calls, sentinel = _run_counting(env)
-    assert calls == 1 and out is sentinel
-    assert env.notices.count(
-        "the cacheguard box failed, so messages now go out with a warning "
-        "until Hermes restarts. Details: /cacheguard") == 1
-    assert env.plugin._H["box_failed"] == "RuntimeError"
-    assert "cacheguard box failed this session" in env.plugin._health_text()
-
-
-def test_after_a_box_crash_later_guarded_messages_warn_and_the_notice_shows_once(env):
-    calls = _block_setup(env, RuntimeError("boom"))
-    _run_counting(env)
-    assert len(calls) == 1
-    sends = []
-    real_remember = env.plugin._remember_send
-    env.plugin._remember_send = lambda *a: (sends.append(1), real_remember(*a))
-    for i in range(2):
-        sid = f"later{i}"  # a fresh chat each time: the first call already refreshed s1's clock
-        seed_session(env, sid, ago=3600)
-        out, n, sentinel = _run_counting(env, session_id=sid)
-        assert n == 1 and out is sentinel
-        assert len(sends) == i + 1  # guarded again (the warn path), not skipped
-    assert len(calls) == 1  # the box was never asked again
-    assert len(_box_broke_notices(env)) == 1
-
-
-def test_error_before_the_box_sends_once_and_keeps_the_box(env, monkeypatch):
-    _block_setup(env, "deny")
     monkeypatch.setattr(env.plugin, "_evaluate", lambda *a, **k: 1 / 0)
     out, calls, sentinel = _run_counting(env)
-    assert calls == 1 and out is sentinel and not _box_broke_notices(env)
-    assert not env.plugin._H.get("box_failed")
+    assert calls == 1 and out is sentinel
 
 
-def test_callback_raises_sends_once_and_switches_the_box_off(env):
-    def cb(*a, **k):
-        raise RuntimeError("painted, then crashed")
-
-    env.approval = cb
-    env.config["cli"] = "block"
+def test_error_in_the_mode_action_sends_once(env, monkeypatch):
+    env.config["cli"] = "warn"
     seed_session(env, ago=3600)
+    monkeypatch.setattr(env.plugin, "_act", lambda *a, **k: 1 / 0)
     out, calls, sentinel = _run_counting(env)
     assert calls == 1 and out is sentinel
-    assert len(_box_broke_notices(env)) == 1 and env.plugin._H["box_failed"] == "RuntimeError"
-
-
-def test_error_after_the_box_in_the_main_handler_sends_once(env, monkeypatch):
-    env.config["cli"] = "block"
-    seed_session(env, ago=3600)
-
-    def act(kwargs, mode, warn_note, command, deny, model, box=None):
-        box["shown"] = True
-        raise RuntimeError("after the box")
-
-    monkeypatch.setattr(env.plugin, "_act", act)
-    out, calls, sentinel = _run_counting(env)
-    assert calls == 1 and out is sentinel and len(_box_broke_notices(env)) == 1
-
-
-@pytest.mark.parametrize("outcome", ["cancelled", "timeout"])
-def test_error_after_a_known_no_send_answer_stays_not_sent(env, monkeypatch, outcome):
-    _crash_after_denied(env, monkeypatch, outcome)
-    out, calls, _ = _run_counting(env)
-    assert calls == 0 and "message not sent" in out.choices[0].message.content
-    assert not _box_broke_notices(env)
-
-
-def test_error_after_a_known_cancel_and_in_the_not_sent_reply_sends_once(env, monkeypatch):
-    _crash_after_denied(env, monkeypatch)
-    monkeypatch.setattr(env.plugin, "_denied_response", lambda *a: None)  # building the reply failed
-    out, calls, sentinel = _run_counting(env)
-    assert calls == 1 and out is sentinel  # never raise into Hermes
-
-
-def test_cancel_with_a_broken_deny_text_is_still_not_sent_in_plain_words(env):
-    _block_setup(env, "deny")
-
-    def broken_deny(outcome, timeout):
-        raise RuntimeError("no text")
-
-    response = env.plugin._gateway_confirmation({}, "title\n\ndetail", broken_deny, "m", {})
-    assert response.choices[0].message.content == env.plugin._NOT_SENT_TEXT
-
-
-def test_cancel_then_crash_building_the_reply_stays_not_sent(env, monkeypatch):
-    _block_setup(env, "deny")
-    real = env.plugin._SyntheticResponse
-    state = {"n": 0}
-
-    def flaky(*a, **k):
-        state["n"] += 1
-        if state["n"] == 1:
-            raise RuntimeError("first build fails")
-        return real(*a, **k)
-
-    monkeypatch.setattr(env.plugin, "_SyntheticResponse", flaky)
-    response = env.plugin._gateway_confirmation({}, "title\n\ndetail", None, "m", {})
-    assert response is None  # the first build failed, and so did the retry path: caller sends
-
-
-def _gateway_block(env, monkeypatch, decision):
-    wait = types.ModuleType("tools.approval_gateway_wait")
-
-    def await_decision(*a):
-        if isinstance(decision, Exception):
-            raise decision
-        return decision
-
-    wait._await_gateway_decision = await_decision
-    monkeypatch.setitem(sys.modules, "tools.approval_gateway_wait", wait)
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-    env.config.update(cli="off", gateway="block", size_k=1)
-    seed_session(env, ago=3600)
-
-
-@pytest.mark.parametrize("decision", [
-    None, "cancel", "x", ["resolved"], {}, {"foo": 1}, RuntimeError("wait crashed"),
-    {"resolved": True, "choice": "new-value"},
-    {"resolved": None, "choice": None},
-    {"resolved": "yes", "choice": "once"},
-    {"resolved": False, "choice": "once"},
-    {"resolved": False, "choice": "deny"},
-])
-def test_gateway_bad_decision_or_error_sends_once_and_switches_the_box_off(env, monkeypatch, decision):
-    _gateway_block(env, monkeypatch, decision)
-    out, calls, sentinel = _run_counting(env, platform="telegram")
-    assert calls == 1 and out is sentinel
-    assert len(_box_broke_notices(env)) == 1
-
-
-@pytest.mark.parametrize("decision,word", [
-    ({"resolved": True, "choice": "deny"}, "cancelled"),
-    ({"resolved": False, "choice": None}, "timeout"),
-    ({"resolved": False, "choice": None, "reason": "timeout"}, "timeout"),
-    ({"resolved": False, "choice": None, "notify_failed": True}, "could not be delivered"),
-    ({"notify_failed": True}, "could not be delivered"),
-])
-def test_gateway_cancel_timeout_undelivered_stay_not_sent(env, monkeypatch, decision, word):
-    _gateway_block(env, monkeypatch, decision)
-    out, calls, _ = _run_counting(env, platform="telegram")
-    text = out.choices[0].message.content
-    assert calls == 0 and "message not sent" in text and word in text
-    assert not _box_broke_notices(env) and not env.plugin._H.get("box_failed")
-
-
-def test_gateway_good_decision_sends_once(env, monkeypatch):
-    _gateway_block(env, monkeypatch, {"resolved": True, "choice": "once"})
-    out, calls, sentinel = _run_counting(env, platform="telegram")
-    assert calls == 1 and out is sentinel and not _box_broke_notices(env)
-
-
-def test_tui_box_failure_sends_once(env, monkeypatch):
-    # The terminal chats ask through the gateway box too; it crashes.
-    _gateway_block(env, monkeypatch, RuntimeError("wait crashed"))
-    env.config.update(cli="block", gateway="off")
-    out, calls, sentinel = _run_counting(env, platform="tui")
-    assert calls == 1 and out is sentinel and len(_box_broke_notices(env)) == 1
-
-
-def test_gateway_import_error_before_the_box_sends_once(env, monkeypatch):
-    _gateway_block(env, monkeypatch, {})
-    monkeypatch.setitem(sys.modules, "tools.approval_gateway_wait", None)  # import fails
-    out, calls, sentinel = _run_counting(env, platform="telegram")
-    assert calls == 1 and out is sentinel and not _box_broke_notices(env)
-
-
-def test_block_without_callback_falls_back_to_warn(env):
-    _block_setup(env, "deny")
-    env.approval = None
-    out, called, sentinel = run_middleware(env)
-    assert called and out is sentinel and env.warned() is not None
-    assert env.plugin._PENDING["s1"].startswith("CGUARD ")
-
-
-def test_block_non_cli_never_prompts(env):
-    calls = _block_setup(env, "deny")
-    out, called, _ = run_middleware(env, platform="discord")
-    assert called and not calls
 
 
 # ------------------------------------------------- own session file only --
 
 
-def test_unknown_session_means_no_box_even_when_hermes_has_history(env):
+def test_unknown_session_means_no_warning_even_when_hermes_has_history(env):
     con = env.db()
     con.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s1','assistant','a',?)",
                 (time.time() - 7200,))
@@ -498,16 +185,14 @@ def test_unknown_session_means_no_box_even_when_hermes_has_history(env):
     con.commit()
     con.close()
     env.config.update(cli="block", size_k=1)
-    env.approval = lambda *a, **k: pytest.fail("no session file: no box")
     out, called, sentinel = run_middleware(env, model="new", provider="p")
     assert called and out is sentinel and env.warned() is None
 
 
 @pytest.mark.parametrize("content", ["not json", "[1, 2]", ""])
-def test_broken_session_file_means_no_box(env, content):
+def test_broken_session_file_means_no_warning(env, content):
     env.config.update(cli="block", size_k=1)
     env.plugin._session_file("s1").write_text(content)
-    env.approval = lambda *a, **k: pytest.fail("broken session file: no box")
     out, called, sentinel = run_middleware(env, model="new", provider="p")
     assert called and out is sentinel and env.warned() is None
 
@@ -521,16 +206,6 @@ def _send_observed(env, **kwargs):
     response = SimpleNamespace(usage=kwargs.pop("usage", None))
     kwargs.update(next_call=lambda: response, request={}, api_call_count=2, api_mode="chat_completions")
     return env.plugin._on_llm_execution(**kwargs)
-
-
-def test_malformed_observation_cannot_bypass_block_confirmation(env):
-    env.config.update(cli="block", size_k=1)
-    env.plugin._obs_path().write_text("[]\n" + json.dumps(_journal_row(ts=1.0)) + "\n")
-    seed_session(env, session_id="old", ago=7200)
-    prompts = []
-    env.approval = lambda command, desc, **kw: (prompts.append(command), "deny")[1]
-    out, called, _ = run_middleware(env, session_id="old")
-    assert not called and "message not sent" in out.choices[0].message.content and len(prompts) == 1
 
 
 def test_wrong_type_in_guard_sends_is_ignored(env):
@@ -553,10 +228,9 @@ def test_send_time_in_the_future_does_not_hold_the_cooldown(env):
     assert env.plugin._cooldown_active(rec, payload, cfg, now)
 
 
-def test_last_time_in_the_future_means_no_box(env):
+def test_last_time_in_the_future_means_no_warning(env):
     env.config["cli"] = "block"
     seed_session(env, ago=-86400)  # clock went back: stored time is a day ahead, the pause is unknown
-    env.approval = lambda *a, **k: pytest.fail("pause unknown: no box")
     out, called, sentinel = run_middleware(env)
     assert called and out is sentinel
 
@@ -592,12 +266,11 @@ def test_outcome_kept_is_hidden_by_default(env, monkeypatch):
     assert env.plugin._PENDING == {} and env.plugin._WARNED == {} and _reply(env) is None
 
 
-def _turn(env, monkeypatch, *, mode="warn", cached=59000, model="m1", answer="once"):
-    """Baseline call, then a call 60 minutes later on the same session. Returns (provider calls, boxes shown)."""
+def _turn(env, monkeypatch, *, mode="warn", cached=59000, model="m1"):
+    """Baseline call, then a call 60 minutes later on the same session. Returns the provider calls."""
     from types import SimpleNamespace
     env.config["cli"] = mode
-    calls, boxes = [], []
-    env.approval = lambda command, desc, **kw: (boxes.append(command), answer)[1]
+    calls = []
     now = [100.0]
     monkeypatch.setattr(env.plugin.time, "time", lambda: now[0])
     _send_observed(env, session_id="s1", model="m1", provider="p", usage=_usage(60000, 59000))
@@ -606,14 +279,13 @@ def _turn(env, monkeypatch, *, mode="warn", cached=59000, model="m1", answer="on
     env.plugin._on_llm_execution(next_call=lambda: (calls.append(1), response)[1], request=big_request(),
                                  session_id="s1", model=model, provider="p", api_call_count=1,
                                  api_mode="chat_completions", platform="cli")
-    return calls, boxes
+    return calls
 
 
-@pytest.mark.parametrize("mode", ["warn", "block"])
-def test_kept_line_hidden_when_option_unset(env, monkeypatch, mode):
+def test_kept_line_hidden_when_option_unset(env, monkeypatch):
     assert "display_on_success" not in env.config
-    calls, boxes = _turn(env, monkeypatch, mode=mode)
-    assert calls == [1] and len(boxes) == (1 if mode == "block" else 0)
+    calls = _turn(env, monkeypatch, mode="warn")
+    assert calls == [1]
     assert env.plugin._PENDING == {} and _reply(env) is None
 
 
@@ -623,19 +295,11 @@ def test_kept_line_shown_when_option_on_warn(env, monkeypatch):
     assert _reply(env) is None and env.posted == [RESULT_LINE]
 
 
-def test_kept_line_shown_when_option_on_block(env, monkeypatch):
-    env.config["display_on_success"] = True
-    calls, boxes = _turn(env, monkeypatch, mode="block")
-    assert calls == [1] and len(boxes) == 1
-    assert _reply(env) is None and env.posted == ["CGUARD 59k reused, 60 min"]
-
-
-@pytest.mark.parametrize("mode,tag", [("warn", "WARN "), ("block", "")])
-def test_loss_line_shown_when_option_off(env, monkeypatch, mode, tag):
+def test_loss_line_shown_when_option_off(env, monkeypatch):
     env.config["display_on_success"] = False
-    _turn(env, monkeypatch, mode=mode, cached=1000)
+    _turn(env, monkeypatch, mode="warn", cached=1000)
     assert _reply(env) is None
-    assert env.posted == [f"CGUARD {tag}cache lost, 59k rebilled, 60 min"]
+    assert env.posted == ["CGUARD WARN cache lost, 59k rebilled, 60 min"]
 
 
 def test_unknown_line_shown_when_option_off(env, monkeypatch):
@@ -662,14 +326,6 @@ def test_model_changed_line_shown_when_cache_lost_whatever_the_option(env, monke
     _turn(env, monkeypatch, mode="warn", model="m2", cached=0)
     assert _reply(env) is None
     assert env.posted == ["CGUARD WARN cache lost, 60k rebilled, model changed"]
-
-
-@pytest.mark.parametrize("display,answer", [(False, "once"), (True, "once"), (False, "deny"), (True, "deny")])
-def test_display_option_never_changes_what_is_sent(env, monkeypatch, display, answer):
-    env.config["display_on_success"] = display
-    calls, boxes = _turn(env, monkeypatch, mode="block", answer=answer)
-    assert calls == ([1] if answer == "once" else [])
-    assert len(boxes) == 1 and "Paused 60 minutes" in boxes[0]
 
 
 def test_outcome_stays_for_its_own_turn(env, monkeypatch):
@@ -746,16 +402,6 @@ def test_no_outcome_when_guard_did_not_act(env):
     assert env.warned() is None and _reply(env) is None
 
 
-def test_no_outcome_when_user_denied(env):
-    env.config = {"cli": "block", "min_gap_seconds": 0, "size_k": 1}
-    env.approval = lambda *a, **k: "deny"
-    seed_session(env, ago=3600, prompt_tokens=60000)
-    result, called, _ = run_middleware(env, request=big_request())
-    assert not called and "message not sent" in result.choices[0].message.content
-    assert env.warned() is None and env.plugin._load_observations() == []
-    assert _reply(env) is None
-
-
 # ------------------------------------------------- final message format
 
 
@@ -765,16 +411,6 @@ def test_kept_result_line_leaves_out_the_estimate_shown_before_sending(env, monk
     _guard_acts(env, monkeypatch)
     _reply(env)
     assert env.posted == [RESULT_LINE]
-
-
-def test_block_result_line_has_no_warn_marker_and_keeps_estimate(env):
-    env.config["cli"] = "block"
-    seed_session(env, ago=3600)
-    _cold_history(env.plugin, cold=6, warm=4)
-    env.approval = lambda *a, **k: "once"
-    run_middleware(env)
-    note = env.plugin._PENDING.get("s1", "")
-    assert note.startswith("CGUARD ") and "WARN" not in note and "similar" not in note
 
 
 def test_model_change_result_has_no_pause_or_estimate(env):
@@ -794,22 +430,10 @@ def test_cli_group_platforms_use_cli_setting(env, platform):
     assert called and out is sentinel and env.warned() is not None
 
 
-def test_desktop_block_prompts_through_gateway_queue(env, monkeypatch):
-    env.config.update(desktop="block", gateway="off", size_k=1)
-    seed_session(env, ago=3600)
-    blocked = object()
-    monkeypatch.setattr(env.plugin, "_healthy", lambda _name: True)
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: ("key", lambda *a: None))
-    monkeypatch.setattr(env.plugin, "_gateway_confirmation", lambda *a: blocked)
-    out, called, _ = run_middleware(env, platform="desktop")
-    assert out is blocked and not called
-
-
 @pytest.mark.parametrize("platform", ["telegram", "discord", "some-new-chat-app"])
 def test_messaging_and_unknown_platforms_use_gateway_setting(env, platform):
     env.config.update(cli="block", gateway="warn", size_k=1)
     seed_session(env, ago=3600)
-    env.approval = lambda *a, **k: pytest.fail("gateway group must not use the terminal box")
     out, called, sentinel = run_middleware(env, platform=platform)
     assert called and out is sentinel and env.warned() is not None
 
@@ -818,7 +442,6 @@ def test_messaging_and_unknown_platforms_use_gateway_setting(env, platform):
 @pytest.mark.parametrize("mode", ["warn", "block"])
 def test_unattended_platforms_are_pure_pass_through(env, platform, mode):
     env.config.update(cli=mode, gateway=mode, size_k=1)
-    env.approval = lambda *a, **k: pytest.fail("unattended must never prompt")
     seed_session(env, ago=3600)
     before = env.plugin._read_session("s1")
     out, called, sentinel = run_middleware(env, platform=platform, model="new")
@@ -842,7 +465,6 @@ def _cron_run(env, monkeypatch):
 def test_kanban_and_cron_workers_on_cli_are_left_alone(env, monkeypatch, mark):
     mark(env, monkeypatch)
     env.config.update(cli="block", size_k=1)
-    env.approval = lambda *a, **k: pytest.fail("unattended must never prompt")
     seed_session(env, ago=3600)
     out, called, sentinel = run_middleware(env, platform="cli", model="new")
     assert called and out is sentinel
@@ -850,7 +472,7 @@ def test_kanban_and_cron_workers_on_cli_are_left_alone(env, monkeypatch, mark):
 
 
 def _blocked(p):
-    return p._deny_text("s1", gap_s=700.0)
+    return p._block_text(60000, "p/m1", None, 700.0, "s1")
 
 
 def _req(p, msgs, key="messages"):
@@ -936,21 +558,6 @@ def test_request_tool_result_before_blocked_is_kept(env):
             {"role": "assistant", "content": _blocked(p)}]
     out = _req(p, msgs)["request"]["messages"]
     assert len(out) == 1 and out[0]["role"] == "user"
-
-
-def test_error_before_the_box_calls_provider_exactly_once(env, monkeypatch):
-    _block_setup(env, "deny")
-    monkeypatch.setattr(env.plugin, "_evaluate", lambda *a, **k: 1 / 0)
-    calls, sentinel = [], object()
-
-    def next_call():
-        calls.append(1)
-        return sentinel
-
-    out = env.plugin._on_llm_execution(
-        next_call=next_call, request=big_request(), session_id="s1", model="m1", provider="p",
-        api_call_count=1, platform="cli", api_mode="chat_completions")
-    assert out is sentinel and len(calls) == 1
 
 
 RESULT_LINE = "CGUARD OK 59k reused, 60 min"
@@ -1051,13 +658,6 @@ def test_unattended_posts_nothing(env, monkeypatch):
 
 
 # --- short posted lines ------------------------------------------------------- #
-
-
-@pytest.mark.parametrize("count,text", [
-    (0, "0"), (999, "999"), (1000, "1k"), (1499, "1k"), (1500, "2k"), (23_400, "23k"),
-    (999_499, "999k"), (999_500, "1.0M"), (1_234_567, "1.2M")])
-def test_short_tokens(env, count, text):
-    assert env.plugin._short_tokens(count) == text
 
 
 @pytest.mark.parametrize("seconds,text", [
@@ -1211,7 +811,7 @@ def test_hash_function_crash_does_not_touch_the_request(env, monkeypatch):
     p = env.plugin
     monkeypatch.setattr(p, "_hash_messages", lambda *a: 1 / 0)
     msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "A"},
-            {"role": "user", "content": "big"}, {"role": "assistant", "content": p._deny_text("s", gap_s=700.0)}]
+            {"role": "user", "content": "big"}, {"role": "assistant", "content": p._block_text(60000, "p/m1", None, 700.0, "s")}]
     out = p._on_llm_request(request={"messages": msgs}, session_id="s", platform="cli")
     assert out["request"]["messages"] == msgs[:2]  # still cleaned
     assert _call(env, _msgs(4), 1)["cause"] == "start"
@@ -1321,7 +921,7 @@ def test_bedrock_cache_point_moving_between_calls_is_not_a_change(env):
 def _history(p):
     """A realistic chat: text and list contents, a tool call, a BLOCKED pair, notes on replies."""
     note = "\n\n" + p._PREFIX + " result: 5k reused"
-    blocked = p._deny_text("s1", gap_s=700.0)
+    blocked = p._block_text(60000, "p/m1", None, 700.0, "s1")
     return [
         {"role": "system", "content": "You are helpful."},
         {"role": "user", "content": "Plan the trip."},
@@ -1366,7 +966,7 @@ def test_growing_history_keeps_identical_cleaned_prefix(env):
         {"role": "user", "content": "Thanks"},
         {"role": "assistant", "content": "Welcome." + "\n\n" + p._PREFIX + " result: 2k reused"},
         {"role": "user", "content": "Bye"},
-        {"role": "assistant", "content": p._deny_text("s1", gap_s=900.0)},
+        {"role": "assistant", "content": p._block_text(60000, "p/m1", None, 900.0, "s1")},
         {"role": "user", "content": "Bye"},
         {"role": "assistant", "content": "Bye!"},
     ]
@@ -1381,18 +981,6 @@ def test_growing_history_keeps_identical_cleaned_prefix(env):
         assert _dump(whole[:len(short)]) == _dump(short)
         checked += 1
     assert checked >= 5
-
-
-def test_cli_denial_preserves_request_and_has_no_observation(env):
-    env.settings['cli'] = 'block'
-    seed_session(env)
-    env.approval = lambda *a, **k: 'deny'
-    request = big_request()
-    original = copy.deepcopy(request)
-    result, called, _ = run_middleware(env, request=request)
-    assert not called and 'message not sent' in result.choices[0].message.content
-    assert request == original
-    assert env.plugin._load_observations() == []
 
 
 def test_every_provider_return_is_recorded_before_intake_even_without_usage(env, monkeypatch):
@@ -1485,7 +1073,6 @@ def test_background_calls_never_show_main_guard(env, monkeypatch):
     env.settings.update(cli='block')
     seed_session(env, ago=3600, prompt_tokens=60000)
     before = env.plugin._get_session('s1')
-    env.approval = lambda *a, **kw: pytest.fail('background requested human approval')
     send(env, {'prompt_tokens': 61000, 'cached': 0}, session_id='s1', task_id='security',
          model='other-model', request=big_request(), api_request_id='s1:security:turn:api:1')
     assert env.plugin._get_session('s1') == before
@@ -1514,32 +1101,6 @@ def test_main_task_identity_wins_over_arbitrary_or_conflicting_request_id(env, m
          api_request_id='s:worker:turn:api:1')
     # The recorder trusts the explicit current task identity, not an ID inference.
     assert env.plugin._get_session('s')['prompt_tokens'] == 100
-
-
-def test_dispatch_is_after_hold_and_gap_uses_previous_response(env, monkeypatch):
-    calls = install_normalizer(monkeypatch)
-    p = env.plugin
-    now = [100.0]
-    monkeypatch.setattr(p.time, 'time', lambda: now[0])
-    send(env, {'prompt_tokens': 60000, 'cached': 59000})
-    now[0] = 500.0
-    env.settings.update(cli='block', pause_m=5)
-    def answer(*a, **k):
-        now[0] = 550.0
-        return 'once'
-    env.approval = answer
-    response = {'usage': {'prompt_tokens': 61000, 'cached': 59000}, 'finish_reason': 'length'}
-    def provider():
-        assert now[0] == 550.0
-        now[0] = 575.0
-        return response
-    assert p._on_llm_execution(next_call=provider, request=big_request(), session_id='s',
-                              model='m', provider='p', api_mode='chat_completions',
-                              api_request_id='same-retry-id', api_call_count=1) is response
-    row = p._load_observations()[-1]
-    assert row['gap_s'] == 450.0 and row['ts'] == 575.0 and row['prev_prompt_tokens'] == 60000
-    assert p._get_session('s')['last_api_ts'] == 575.0
-    assert calls[-1][1:] == ('p', 'chat_completions')
 
 
 def test_present_empty_usage_stays_zero_and_missing_usage_stays_null(env, monkeypatch):
@@ -1615,53 +1176,6 @@ def test_concurrent_returns_have_complete_rows_and_atomic_session_state(env, mon
     assert not list((env.home/'cacheguard/sessions').glob('*.tmp'))
 
 
-def test_unanswered_cli_confirmation_cancels_without_provider(env):
-    env.settings['cli'] = 'block'
-    seed_session(env)
-    env.approval = lambda *a, **k: 'timeout'
-    out, called, _ = run_middleware(env)
-    assert not called and 'message not sent' in out.choices[0].message.content
-
-
-def test_send_cooldown_survives_failed_provider_but_deny_does_not(env, monkeypatch):
-    import pytest
-    p = env.plugin
-    env.settings.update(cli='block', pause_m=5)
-    seed_session(env, session_id='s', ago=3600)
-    decisions = []
-    env.approval = lambda *a, **k: (decisions.append('once'), 'once')[1]
-    now = [10000.0]
-    # Keep legacy fallback old enough in this synthetic clock.
-    put_session(p, 's', {'last_api_ts': 1, 'model': 'p/m', 'prompt_tokens': 30000})
-    monkeypatch.setattr(p.time, 'time', lambda: now[0])
-    def fail():
-        raise RuntimeError('provider failed')
-    kw = dict(next_call=fail, request=big_request(30000), session_id='s', provider='p', model='m',
-              api_mode='chat_completions', api_call_count=1)
-    with pytest.raises(RuntimeError):
-        p._on_llm_execution(**kw)
-    now[0] += 1
-    with pytest.raises(RuntimeError):
-        p._on_llm_execution(**kw)
-    assert decisions == ['once']
-    now[0] += 300
-    env.approval = lambda *a, **k: (decisions.append('deny'), 'deny')[1]
-    p._on_llm_execution(**kw)
-    p._on_llm_execution(**kw)
-    assert decisions == ['once', 'deny', 'deny']
-
-
-def test_api_mode_change_with_same_model_opens_model_change_box(env, monkeypatch):
-    install_normalizer(monkeypatch)
-    put_session(env.plugin, 's', {'last_api_ts': 1.0, 'model': 'p/m', 'api_mode': 'chat_completions'})
-    send(env, {'prompt_tokens': 30000, 'cached': 29000})
-    env.settings['cli'] = 'block'
-    env.approval = lambda *a, **k: 'deny'
-    response = send(env, {'prompt_tokens': 30000}, api_mode='anthropic_messages')
-    assert response.usage is None and 'message not sent' in response.content[0].text
-    assert len(env.plugin._load_observations()) == 1
-
-
 def test_warn_label_only_when_cost_is_likely(env):
     p = env.plugin
     reused = {'evaluable': True, 'cold': False, 'cache_read_tokens': 59000, 'gap_s': 3600}
@@ -1686,14 +1200,230 @@ def test_first_call_of_chat_says_it_is_normal(env):
     assert env.plugin._outcome_text(row) == 'cache unknown, first call'
 
 
-@pytest.mark.parametrize("trigger", ["idle", "model_change"])
-def test_gateway_block_without_approval_path_warns_and_says_degraded(env, monkeypatch, trigger):
-    env.config.update(gateway="block", cli="off", size_k=1)
-    if trigger == "idle":
-        seed_session(env, ago=3600)
-    else:
-        seed_session(env, ago=10, model="p/old")
-    monkeypatch.setattr(env.plugin, "_gateway_approval", lambda: None)
-    out, called, sentinel = run_middleware(env, platform="telegram", model="new")
+# ------------------------------------------------- pre_llm_call: the block --
+
+HELD = "[Message withheld: a pre_llm_call policy hook blocked it.]"
+RETRY_LINE = "\nTo send it anyway: /retry, or send it again.\nOr start /new and paste it. Session ID: s1"
+IMAGE_LINE = "\nTo send it anyway: attach the image again and send it again.\nOr start /new and paste it. Session ID: s1"
+
+
+def _hook(env, text="x" * 240000, *, session_id="s1", model="m1", platform="cli", task_id=None, history=None,
+          **extra):
+    """Call the pre_llm_call hook the way Hermes does (bare model name, last history item = the message)."""
+    return env.plugin._on_pre_llm_call(
+        conversation_history=history if history is not None else [{"role": "user", "content": text}],
+        user_message=text, session_id=session_id, task_id=task_id or session_id, model=model, platform=platform,
+        is_first_turn=False, sender_id=None, turn_id="t1", parent_session_id=None, **extra)
+
+
+def _blockable(env, mode="block", **kw):
+    env.config["cli"] = mode
+    seed_session(env, ago=3600, **kw)
+
+
+def test_hook_blocks_after_a_pause_in_block_mode(env):
+    _blockable(env)
+    out = _hook(env)
+    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,008 tokens may be rebilled" + RETRY_LINE}
+
+
+def test_hook_block_text_has_the_loss_counts_when_known(env):
+    _blockable(env)
+    _cold_history(env.plugin, cold=6, warm=4)
+    out = _hook(env)
+    assert "tokens may be rebilled · lost 6 of 10 similar pauses" + RETRY_LINE in out["message"]
+
+
+def test_hook_block_text_says_one_minute_in_the_singular(env):
+    env.config.update({"cli": "block", "pause_m": 1})
+    seed_session(env, ago=70)
+    assert "1 minute pause 🕐" in _hook(env)["message"]
+
+
+def test_hook_uses_the_one_line_text_when_tiny_block_is_on(env):
+    _blockable(env)
+    env.config["tiny_block"] = True
+    out = _hook(env)
+    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "1h 🕐 · ~60kt"}
+    assert env.plugin._is_blocked_reply({"role": "assistant", "content": out["message"]})
+
+
+def test_hook_same_text_again_goes_through_once(env):
+    _blockable(env)
+    assert _hook(env)["action"] == "block"
+    assert _hook(env) is None  # the resend: not evaluated again
+    assert _hook(env)["action"] == "block"  # and the pass is used up
+
+
+def test_hook_a_different_text_is_evaluated_again(env):
+    _blockable(env)
+    assert _hook(env)["action"] == "block"
+    assert _hook(env, "y" * 240000)["action"] == "block"
+    assert _hook(env, "y" * 240000) is None
+    assert _hook(env, "small") is None  # a different small message: evaluated, nothing to say
+
+
+def test_hook_resend_is_per_session(env):
+    _blockable(env)
+    seed_session(env, session_id="s2", ago=3600)
+    assert _hook(env)["action"] == "block"
+    assert _hook(env, session_id="s2")["action"] == "block"
+    assert _hook(env) is None
+
+
+@pytest.mark.parametrize("mode", ["off", "warn"])
+def test_hook_never_blocks_in_off_or_warn_mode(env, mode):
+    _blockable(env, mode)
+    assert _hook(env) is None
+
+
+def test_hook_uses_the_mode_of_the_platform_group(env):
+    env.config.update({"cli": "warn", "gateway": "block"})
+    seed_session(env, ago=3600)
+    assert _hook(env) is None
+    assert _hook(env, platform="telegram")["action"] == "block"
+
+
+def test_hook_single_query_is_left_to_the_warning(env, monkeypatch):
+    _blockable(env)
+    monkeypatch.setattr(env.plugin, "_single_query", lambda: True)
+    assert _hook(env) is None
+
+
+@pytest.mark.parametrize("platform", ["cron", "kanban", "api_server"])
+def test_hook_unattended_is_left_alone(env, platform):
+    _blockable(env)
+    assert _hook(env, platform=platform) is None
+
+
+def test_hook_kanban_worker_on_cli_is_left_alone(env, monkeypatch):
+    _blockable(env)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t1")
+    assert _hook(env) is None
+
+
+def test_hook_auxiliary_call_is_left_alone(env):
+    _blockable(env)
+    assert _hook(env, task_id="other") is None
+
+
+@pytest.mark.parametrize("content", [
+    [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}],
+    [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}],
+])
+def test_hook_media_in_the_message_is_not_blocked(env, content):
+    _blockable(env)
+    assert _hook(env, history=[{"role": "user", "content": content}]) is None
+    env.config["block_images"] = False
+    assert _hook(env, history=[{"role": "user", "content": content}]) is None
+
+
+def test_hook_block_images_blocks_a_message_with_an_image(env):
+    _blockable(env)
+    env.config["block_images"] = True
+    content = [{"type": "text", "text": "x" * 240000},
+               {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    out = _hook(env, history=[{"role": "user", "content": content}])
+    assert out["action"] == "block"
+    assert out["message"].endswith(IMAGE_LINE) and "/retry" not in out["message"]
+
+
+def test_hook_block_images_changes_nothing_for_plain_text(env):
+    _blockable(env)
+    env.config["block_images"] = True
+    assert _hook(env)["message"].endswith(RETRY_LINE)
+
+
+def test_hook_block_images_still_ignores_content_that_is_not_a_list_or_text(env):
+    _blockable(env)
+    env.config["block_images"] = True
+    assert _hook(env, history=[{"role": "user", "content": None}]) is None
+
+
+def test_hook_session_id_is_written_on_one_line(env):
+    _blockable(env)
+    seed_session(env, session_id='a"b\nc', ago=3600)
+    out = _hook(env, session_id='a"b\nc')
+    assert out["message"].endswith(' Session ID: a\\"b\\nc') and out["message"].count("\n") == 2
+
+
+def test_hook_text_parts_are_blocked_like_a_string(env):
+    _blockable(env)
+    parts = [{"type": "text", "text": "x" * 240000}]
+    assert _hook(env, history=[{"role": "user", "content": parts}])["action"] == "block"
+
+
+def test_hook_model_change_is_found_by_the_bare_name(env):
+    _blockable(env, model="p/old")
+    out = _hook(env, model="new")
+    assert out["message"] == (env.plugin._BLOCKED_PREFIX
+                              + "model changed p/old → p/new · ~60,008 tokens may be rebilled" + RETRY_LINE)
+
+
+def test_hook_same_bare_model_is_a_pause_not_a_model_change(env):
+    _blockable(env, model="p/m1")
+    assert "model changed" not in _hook(env, model="m1")["message"]
+
+
+def test_hook_api_mode_change_is_not_a_model_change_here(env):
+    _blockable(env, model="p/m1", api_mode="chat_completions")
+    assert "pause" in _hook(env, model="m1")["message"]
+
+
+def test_hook_model_change_small_context_is_silent(env):
+    _blockable(env, model="p/old")
+    assert _hook(env, "hi", model="new") is None
+
+
+def test_hook_no_pause_no_block(env):
+    env.config["cli"] = "block"
+    seed_session(env, ago=10)
+    assert _hook(env) is None
+
+
+def test_hook_unknown_session_is_not_blocked(env):
+    env.config["cli"] = "block"
+    assert _hook(env, session_id="never-seen") is None
+
+
+@pytest.mark.parametrize("history", [None, [], "x", [None], [{"role": "user"}]])
+def test_hook_odd_history_lets_it_go(env, history):
+    _blockable(env)
+    assert env.plugin._on_pre_llm_call(conversation_history=history, user_message="x" * 240000,
+                                       session_id="s1", task_id="s1", model="m1", platform="cli") is None
+
+
+def test_hook_internal_error_lets_it_go(env, monkeypatch):
+    _blockable(env)
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(env.plugin, "_evaluate", boom)
+    assert _hook(env) is None
+
+
+def test_hook_garbage_arguments_let_it_go(env):
+    assert env.plugin._on_pre_llm_call() is None
+    assert env.plugin._on_pre_llm_call(session_id=["bad"], user_message=3) is None
+
+
+def test_hook_leaves_the_middleware_to_warn(env):
+    """After the hook let a message through, llm_execution warns in block mode: the provider is called."""
+    _blockable(env)
+    out, called, sentinel = run_middleware(env)
     assert called and out is sentinel and env.warned() is not None
-    assert 'cacheguard cannot show the box here: it only warns.' in env.plugin._H['noticed']
+
+
+def test_clean_history_drops_a_withheld_message_and_our_reply(env):
+    reply = env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,000 tokens may be rebilled" + RETRY_LINE
+    items = [
+        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "pong"},
+        {"role": "user", "content": HELD}, {"role": "assistant", "content": reply},
+        {"role": "user", "content": "question two"},
+    ]
+    assert env.plugin._clean_history(items) == [items[0], items[1], items[4]]
+    request = {"messages": items}
+    out = env.plugin._on_llm_request(request=request, session_id="s1", platform="cli")
+    assert out["request"]["messages"] == [items[0], items[1], items[4]]
+    assert "withheld" not in json.dumps(out["request"])

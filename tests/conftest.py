@@ -45,9 +45,6 @@ class Env:
         self.home = home
         self.plugin = plugin
         self.settings = {}        # plugins.entries.cacheguard.settings
-        # What the user answers in the box: a callable(command, description, **flags) giving once/session/always/deny/timeout
-        # (or a ready gateway decision dict), or None (nobody to ask). It stands behind the fake gateway box below.
-        self.approval = None
         self.posted = []          # texts given to ctx.post_message
         self.post_ok = True       # False: post_message returns ok=False; an Exception: it raises
 
@@ -161,27 +158,12 @@ def env(tmp_path, monkeypatch):
         inp = max(0, raw.get("prompt_tokens", 0) - read - write)
         return SimpleNamespace(input_tokens=inp, cache_read_tokens=read, cache_write_tokens=write,
                                prompt_tokens=inp + read + write)
-    def await_decision(key, notify, data):
-        """The gateway box: asks e.approval and answers the way Hermes does (a dict with resolved/choice)."""
-        answer = e.approval(data["command"], data["description"],
-                            allow_permanent=data["allow_permanent"], allow_session=data["allow_session"])
-        if isinstance(answer, dict):
-            return answer
-        if answer == "timeout":
-            return {"resolved": False, "choice": None}
-        return {"resolved": True, "choice": answer}
-
     fakes = {
         "agent.usage_pricing": _mod("agent.usage_pricing", normalize_usage=normalize),
         "hermes_constants": _mod("hermes_constants", get_hermes_home=lambda: tmp_path),
         "hermes_cli": _mod("hermes_cli"),
-        "hermes_cli.config": _mod("hermes_cli.config", read_raw_config_readonly=lambda: {}),
         "hermes_cli.middleware": _mod("hermes_cli.middleware", VALID_MIDDLEWARE={"llm_execution", "llm_request"}),
-        "hermes_cli.plugins": _mod("hermes_cli.plugins", VALID_HOOKS={"transform_llm_output"}),
-        "tools": _mod("tools"),
-        "tools.approval": _mod("tools.approval", _gateway_notify_cb=lambda key: (lambda *a: None) if e.approval else None),
-        "tools.approval_context": _mod("tools.approval_context", get_current_session_key=lambda default="": "key"),
-        "tools.approval_gateway_wait": _mod("tools.approval_gateway_wait", _await_gateway_decision=await_decision),
+        "hermes_cli.plugins": _mod("hermes_cli.plugins", VALID_HOOKS={"transform_llm_output", "pre_llm_call"}),
     }
     def post_message(text):
         if isinstance(e.post_ok, Exception):
@@ -261,10 +243,6 @@ def _cold_history(plugin, cold, warm, gap=3600):
             "cache_read_tokens": 0 if lost else 50000, "cache_write_tokens": 0,
             "prev_prompt_tokens": 50000, "cause": None,
         })
-
-
-def _box_broke_notices(env):
-    return [t for t in env.notices if "the cacheguard box failed" in t]
 
 
 def _run_counting(env, platform="cli", session_id="s1"):

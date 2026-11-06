@@ -19,3 +19,5 @@ plugins:
         journal_rows: 10000        # most calls kept in the stats (a count, not days; whole number, 1 or more)
         chat_files: 200            # most chats that keep a tracking file, newest first (whole number, 1 or more)
         display_on_success: false  # show the result line when the cache was kept (loss and unknown always show)
+        block_images: false        # also block a message with an image (then attach it again to send)
+        tiny_block: false          # one short BLOCKED line instead of three

@@ -16,6 +16,7 @@ _PENDING: dict[str, str] = {}  # session_id -> note to post after that session's
 _PENDING_TURN: dict[str, str] = {}  # session_id -> turn_id the note belongs to (when known)
 _WARNED: dict[str, str] = {}  # session_id -> warn-mode marker, shown with the result
 _CHANGED: dict[str, tuple[str, str]] = {}  # session_id -> (previous, new) model of a model-change turn
+_HELD: dict[str, str] = {}  # session_id -> sha256 of the user message the pre_llm_call hook just blocked
 _NOTICES_SEEN: dict[str, set] = {}  # session_id -> one-off notices already posted to that session
 # session_id -> (api_request_id, message count, hash, prefix changed?) of the call being sent;
 # saved to the session file once the call is answered (see _record_response)
@@ -36,8 +37,6 @@ def _on_llm_execution(**kwargs: Any) -> Any:
         return next_call()
     auxiliary = _is_auxiliary(kwargs)
     acted = False
-    box: dict[str, Any] = {}  # per call: "shown" once the question went to Hermes, "denied" once a no-send answer is known
-    model, deny = "", None  # only for the "not sent" text if the plugin fails after a known Cancel
     cfg = dict(config.DEFAULTS)
     sid = kwargs.get("session_id")
     if isinstance(sid, str) and not auxiliary and kwargs.get("api_call_count") == 1:
@@ -47,38 +46,14 @@ def _on_llm_execution(**kwargs: Any) -> Any:
         surface_mode = config._surface_mode(kwargs, cfg)
         triggered = None if auxiliary else _evaluate(kwargs, cfg, surface_mode)
         if triggered:
-            size, model, prev, gap_s = triggered
-            note, command, cause = _box_texts(size, model, prev, gap_s)
+            _, model, prev, _ = triggered
             if prev is not None and isinstance(sid, str) and sid:
                 _CHANGED[sid] = (prev, model)
-
-            def deny(outcome: str, timeout: int) -> str:
-                return confirm._deny_text(kwargs.get("session_id"), gap_s=gap_s, outcome=outcome,
-                                          timeout=timeout, cause=cause)
-
-            blocked = _act(kwargs, surface_mode, note, command, deny, model, box)
-            if blocked is not None:
-                return blocked  # turn ends WITHOUT calling the provider
+            _act(kwargs, surface_mode, f"model changed {prev} → {model}" if prev is not None else "")
             acted = True
-    except Exception as exc:
-        # The plugin failed: the message goes out. Only a Cancel (or timeout) already
-        # received stays "not sent"; if even that reply fails, sending beats raising into Hermes.
-        if box.get("denied"):
-            blocked = confirm._denied_response(model, deny, box["denied"], kwargs.get("api_mode"))
-            if blocked is not None:
-                return blocked
-        elif box.get("shown"):
-            confirm._box_broke(exc)  # the box call (or code right after it) failed: no box until restart
+    except Exception:
+        pass  # the plugin failed: the message goes out
     return _send(kwargs, next_call, acted, bool(cfg.get("display_on_success")))
-
-
-def _box_texts(size: int, model: str, prev: str | None, gap_s: float | None) -> tuple[str, str, str | None]:
-    """(warn note, box text, cause shown when the reply is "not sent") for a model change or a pause."""
-    if prev is not None:
-        return (f"model changed {prev} → {model}",
-                f"{config._PREFIX} Model changed\n\n{prev} → {model} · ~{size:,} tokens may be rebilled",
-                "model changed")
-    return "", confirm._cache_cost_text(size, gap_s, confirm._cold_counts(model, gap_s)), None
 
 
 def _start_turn(sid: str) -> None:
@@ -101,24 +76,12 @@ def _send(kwargs: dict[str, Any], next_call: Any, acted: bool, display_on_succes
     response = next_call()
     response_ts = time.time()
     try:
-        if not isinstance(response, confirm._SyntheticResponse):
-            verdict = measure._record_response(kwargs, response, dispatch_ts, response_ts, acted)
-            if verdict is not None:
-                _queue_outcome(kwargs, verdict, display_on_success)
+        verdict = measure._record_response(kwargs, response, dispatch_ts, response_ts, acted)
+        if verdict is not None:
+            _queue_outcome(kwargs, verdict, display_on_success)
     except Exception:
         pass
     return response
-
-
-def _short_tokens(count: int) -> str:
-    """23k, 999, 1.2M (nearest thousand; exact under 1,000)."""
-    count = max(0, int(count))
-    if count < 1000:
-        return str(count)
-    thousands = (count + 500) // 1000
-    if thousands < 1000:
-        return f"{thousands}k"
-    return f"{count / 1_000_000:.1f}M"
 
 
 _COMPACT_UNITS = {"second": "s", "minute": "min", "hour": "h", "day": "d"}
@@ -139,8 +102,8 @@ def _outcome_text(row: dict[str, Any], change: tuple[str, str] | None = None) ->
         if reloaded is None:
             return "cache unknown, model changed"
         if measure._cache_lost(reloaded, row["prompt_tokens"]):
-            return f"cache lost, {_short_tokens(reloaded)} rebilled, model changed"
-        return f"{_short_tokens(row['cache_read_tokens'])} reused, model changed"
+            return f"cache lost, {measure._short_tokens(reloaded)} rebilled, model changed"
+        return f"{measure._short_tokens(row['cache_read_tokens'])} reused, model changed"
     if not row["evaluable"]:
         reason = {
             "usage_missing": "usage unavailable",
@@ -160,8 +123,8 @@ def _outcome_text(row: dict[str, Any], change: tuple[str, str] | None = None) ->
                 reason = "little history"
         return f"cache unknown, {reason}{pause}"
     if row["cold"]:
-        return f"cache lost, {_short_tokens(row['miss_delta'])} rebilled{pause}"
-    return f"{_short_tokens(row['cache_read_tokens'])} reused{pause}"
+        return f"cache lost, {measure._short_tokens(row['miss_delta'])} rebilled{pause}"
+    return f"{measure._short_tokens(row['cache_read_tokens'])} reused{pause}"
 
 
 def _queue_note(session_id: Any, text: str, turn_id: Any = None) -> None:
@@ -377,35 +340,17 @@ def _on_llm_request(**kwargs: Any) -> Any:
     return None
 
 
-def _act(kwargs: dict[str, Any], mode: Any,
-         warn_note: str, command: str, deny_text: Any, model: str,
-         box: dict[str, Any]) -> Any:
-    """Apply a mode ("off" | "warn" | "block"). Return a synthetic response to end the turn, else None (send).
+def _act(kwargs: dict[str, Any], mode: Any, warn_note: str) -> None:
+    """Apply a mode ("off" | "warn" | "block"): mark the session for the result line.
 
-    A warning prints nothing: warn_note ("" or a short reason) marks the session, and the result
-    line after the reply starts with `WARN` or `OK`. `box` is the caller's per-call marker.
+    Nothing is printed before the send: warn_note ("" or a short reason) marks the session, and the
+    result line after the reply starts with `WARN` or `OK`. Block is done by the pre_llm_call hook
+    (_on_pre_llm_call); here it only warns.
     """
     if mode == "off":
-        return None
-    shown = False
-    if mode == "block" and health._H.get("box_failed"):
-        mode = "warn"  # the box failed earlier in this process: warn until Hermes restarts
-    if mode == "block" and confirm._single_query():
-        mode = "warn"  # `chat -q`: no screen, a prompt would only wait out the timeout
-    if mode == "block" and confirm._gateway_approval() is None:
-        mode = "warn"  # degraded: no way to ask here (editor/ACP, or a Hermes without the gateway box)
-        health._notice(health._NO_BOX_TEXT)
-    if config._platform(kwargs) in config._CLI_PLATFORMS:
-        command = command.replace("\n\n", "\n", 1)  # the terminal box needs no blank line under its title
-    if mode == "block" and confirm._api_mode_supported(kwargs):
-        blocked = confirm._gateway_confirmation(kwargs, command, deny_text, model, box)
-        shown = True
-        if blocked is not None:
-            return blocked
-    if not shown and isinstance(kwargs.get("session_id"), str) and kwargs.get("session_id"):
-        # No panel was shown (the panel already carries the info): say it with the result line.
+        return
+    if isinstance(kwargs.get("session_id"), str) and kwargs.get("session_id"):
         _WARNED[kwargs["session_id"]] = warn_note
-    return None
 
 
 def _domain_key(payload: dict[str, Any]) -> str:
@@ -443,7 +388,7 @@ def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) ->
     # Only the first call of a turn: the read that pays the cold context.
     if int(kwargs.get("api_call_count") or 0) != 1:
         return None
-    if surface_mode not in ("warn", "block"):  # block without an approval path acts like warn (see _act)
+    if surface_mode not in ("warn", "block"):  # block only warns here: the pre_llm_call hook does the blocking
         return None
 
     session_id = kwargs.get("session_id") or ""
@@ -470,3 +415,52 @@ def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) ->
     if not factors["window_crossed"] or not factors["floor_crossed"]:
         return None
     return risk["tokens_at_risk"], model, None, factors["gap_s"]
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _on_pre_llm_call(**kwargs: Any) -> Any:
+    """Block a large message after a pause (Hermes pre_llm_call hook). Never raises: any error lets it go.
+
+    A blocked message is not sent. The user sends it with /retry or by sending the same text again;
+    that one resend is let through without a new check.
+    """
+    try:
+        if config._is_unattended(kwargs) or _is_auxiliary(kwargs):
+            return None
+        sid = kwargs.get("session_id")
+        text = kwargs.get("user_message")
+        held = _HELD.pop(sid, None) if isinstance(sid, str) else None
+        if held is not None and isinstance(text, str) and held == _text_hash(text):
+            return None  # the resend of the message just blocked
+        cfg = config._cfg()
+        if config._surface_mode(kwargs, cfg) != "block" or confirm._single_query():
+            return None
+        history = kwargs.get("conversation_history")
+        if not isinstance(sid, str) or not sid or not isinstance(text, str):
+            return None
+        if not isinstance(history, list) or not history or not isinstance(history[-1], dict):
+            return None
+        content = history[-1].get("content")
+        image = _message_text(history[-1]) is None
+        if image and (not isinstance(content, list) or not cfg["block_images"]):
+            return None  # an image or other media: /retry refuses it, so only a warning (unless block_images)
+        rec = storage._get_session(sid)
+        stored = rec.get("model")
+        payload = {
+            "session_id": sid, "platform": kwargs.get("platform"), "api_call_count": 1,
+            "provider": stored.split("/", 1)[0] if isinstance(stored, str) else None,
+            "model": kwargs.get("model"), "api_mode": rec.get("api_mode"),
+            "request": {"messages": history},
+        }
+        triggered = _evaluate(payload, cfg, "block")
+        if not triggered:
+            return None
+        size, model, prev, gap_s = triggered
+        message = confirm._block_text(size, model, prev, gap_s, sid, image, tiny=cfg["tiny_block"])
+        config._put_capped(_HELD, sid, _text_hash(text))
+        return {"action": "block", "message": message}
+    except Exception:
+        return None

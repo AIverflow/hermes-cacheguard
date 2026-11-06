@@ -14,6 +14,8 @@ DEFAULTS: dict[str, Any] = {
     "desktop": "warn",  # desktop app, web UI
     "gateway": "off",  # Telegram and other messaging chats
     "display_on_success": False,  # show the result line when the cache was kept (loss and unknown always show)
+    "block_images": False,  # also block a message with an image (it must then be attached again)
+    "tiny_block": False,  # one short BLOCKED line instead of three
     "size_k": 20,  # thousands of tokens
     "pause_m": 10,
     "journal_rows": 10000,  # most calls kept in the journal (a count, not days)
@@ -69,7 +71,7 @@ def _is_unattended(payload: dict[str, Any]) -> bool:
 
 
 def _is_cli_or_desktop(payload: dict[str, Any]) -> bool:
-    """True for the terminal and the desktop app (they can show a box), false for chat platforms."""
+    """True for the terminal and the desktop app (they have a screen), false for chat platforms."""
     return _platform(payload) in _CLI_PLATFORMS | _DESKTOP_PLATFORMS
 
 
@@ -122,15 +124,6 @@ def _size_tokens(size_k: Any) -> int:
     return round(float(size_k) * 1000)
 
 
-def _raw_config() -> dict[str, Any]:
-    """config.yaml as a mapping, for reading only: just for `approvals.timeout`, which is Hermes' own
-    setting (ours go through ctx.get_config). The read-only call skips the deep copy.
-    Never change what this returns."""
-    from hermes_cli import config as hermes_config
-
-    return hermes_config.read_raw_config_readonly() or {}
-
-
 def _cfg() -> dict[str, Any]:
     cfg = dict(DEFAULTS)
     errors = set()
@@ -151,8 +144,9 @@ def _cfg() -> dict[str, Any]:
         cfg[key] = DEFAULTS[key]
         errors.add(f"invalid {key}; using default")
 
-    if not isinstance(cfg["display_on_success"], bool):
-        invalid("display_on_success")
+    for key in ("display_on_success", "block_images", "tiny_block"):
+        if not isinstance(cfg[key], bool):
+            invalid(key)
     for key in ("cli", "desktop", "gateway"):
         if not isinstance(cfg[key], str) or cfg[key] not in ("off", "warn", "block"):
             invalid(key)

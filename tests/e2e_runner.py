@@ -1,7 +1,7 @@
 """Launcher run by the installed Hermes Python (read-only use of the Hermes tree).
 
     python -I e2e_runner.py cli <hermes args...>      # the hermes CLI
-    python -I e2e_runner.py web <path to server.py>   # hermes-webui
+    python -I e2e_runner.py script <file.py> [args]   # a script (hermes-webui's server.py, a contract run)
 
 Same bootstrap as the gateway contract test: the installed dependency environment is added to
 sys.path instead of letting Hermes build one under the temporary HERMES_HOME (that takes ~1 min).
@@ -31,5 +31,5 @@ if mode == "cli":
     sys.argv = ["hermes"] + rest
     runpy.run_module("hermes_cli.main", run_name="__main__", alter_sys=True)
 else:
-    sys.argv = [rest[0]]
+    sys.argv = rest
     runpy.run_path(rest[0], run_name="__main__")

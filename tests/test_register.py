@@ -16,7 +16,7 @@ def test_register(env):
             reg["cmd"].append(name)
 
     env.plugin.register(Ctx())
-    assert reg == {"mw": ["llm_execution", "llm_request"], "hook": ["transform_llm_output"], "cmd": ["cacheguard"]}
+    assert reg == {"mw": ["llm_execution", "llm_request"], "hook": ["transform_llm_output", "pre_llm_call"], "cmd": ["cacheguard"]}
 
 
 def test_register_without_llm_execution_middleware_still_loads(env):
@@ -34,7 +34,7 @@ def test_register_without_llm_execution_middleware_still_loads(env):
             reg["cmd"].append(name)
 
     env.plugin.register(Ctx())
-    assert reg == {"hook": ["transform_llm_output"], "cmd": ["cacheguard"]}
+    assert reg == {"hook": ["transform_llm_output", "pre_llm_call"], "cmd": ["cacheguard"]}
     lines = [t for t in env.notices if t == "cacheguard is off: it could not start."]
     assert len(lines) == 1
     assert "llm_execution" not in lines[0] and "AttributeError" not in lines[0]
@@ -44,6 +44,7 @@ def test_register_without_llm_execution_middleware_still_loads(env):
 @pytest.mark.parametrize("hook, effect", [
     ("llm_request", "cacheguard lines may reach the model."),
     ("transform_llm_output", "no result lines."),
+    ("pre_llm_call", "cacheguard cannot block here: it only warns."),
 ])
 def test_health_names_a_hook_that_failed_to_register(env, hook, effect):
     class Ctx:

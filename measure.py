@@ -187,7 +187,7 @@ def evaluate_observations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _record_response(payload: dict[str, Any], response: Any, dispatch_ts: float, response_ts: float,
                      acted: bool) -> dict[str, Any] | None:
     """Keep the call's row and session update. The verdict (it needs the whole journal) only when
-    `acted`: the guard asked or warned, so a result line is due."""
+    `acted`: the guard warned, so a result line is due."""
     raw_usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     prompt = cached = written = None
     if raw_usage is not None:
@@ -215,7 +215,7 @@ def _record_response(payload: dict[str, Any], response: Any, dispatch_ts: float,
         if not auxiliary:
             row = detect_observation({"session": rec}, attempt)
         if row and config._finite_number(row["gap_s"]) and row["gap_s"] >= config._MIN_PAUSE_S:
-            storage._write_observation(row)  # only what the table and the box can use
+            storage._write_observation(row)  # only what the table and the block text can use
             storage._maybe_trim_observations(config._cfg()["journal_rows"])
         if not auxiliary:
             updated = dict(rec, last_api_ts=response_ts, model=attempt["model"], api_mode=attempt["api_mode"])
@@ -238,7 +238,7 @@ def _record_response(payload: dict[str, Any], response: Any, dispatch_ts: float,
 # bit longer than the time the provider counts.
 _GAP_EDGES = [360.0, 1260.0, 2460.0, 3660.0, 5460.0, 7260.0]
 _GAP_LABELS = ["1-6m", "6-21m", "21-41m", "41-61m", "61-91m", "91-121m", ">2h01"]
-_MIN_CHANCE_CALLS = 10  # measurements in a pause bucket before the box shows lost/calls
+_MIN_CHANCE_CALLS = 10  # measurements in a pause bucket before the block text shows lost/calls
 _MIN_TABLE_CALLS = 5  # measurements before the summary shows the cold-cache table
 _MIN_SUGGEST_CALLS = 20  # measurements of a model before the table suggests a pause for it
 _SUGGEST_LOSS = 0.10  # suggested pause: the longest one where at most this share of calls lost the cache
@@ -295,6 +295,17 @@ def _short_pause(seconds: float) -> str:
     if not hours:
         return f"{minutes}m"
     return f"{hours}h{minutes:02d}" if minutes else f"{hours}h"
+
+
+def _short_tokens(count: int) -> str:
+    """23k, 999, 1.2M (nearest thousand; exact under 1,000)."""
+    count = max(0, int(count))
+    if count < 1000:
+        return str(count)
+    thousands = (count + 500) // 1000
+    if thousands < 1000:
+        return f"{thousands}k"
+    return f"{count / 1_000_000:.1f}M"
 
 
 def _suggested_pause(points: list[tuple[float, bool]]) -> str:

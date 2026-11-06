@@ -321,3 +321,10 @@ def test_images_cost_a_flat_amount_not_their_base64_length(env):
         assert 5000 <= _tokens(env, messages) <= base + 1700
         assert json.dumps(messages) == before  # caller data untouched
     assert base >= 4900  # ordinary text is still counted by length
+
+
+@pytest.mark.parametrize("count,text", [
+    (0, "0"), (999, "999"), (1000, "1k"), (1499, "1k"), (1500, "2k"), (23_400, "23k"),
+    (999_499, "999k"), (999_500, "1.0M"), (1_234_567, "1.2M")])
+def test_short_tokens(env, count, text):
+    assert env.plugin._short_tokens(count) == text

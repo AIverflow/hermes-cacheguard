@@ -36,50 +36,19 @@ def test_without_set_config_health_says_so(env, monkeypatch):
 
 def test_health_notices_show_no_internal_names(env):
     internal = ("state.db", "llm_execution", "degraded",
-                "gateway_approval", "session_key", "Error", "_")
+                "Error", "_")
     for name, effect in env.plugin._HEALTH_EFFECTS.items():
         assert effect.endswith(".") and not any(word in effect for word in internal), name
 
 
-def _fake_approval_modules(monkeypatch, notify=True, wait=True):
-    import sys
-    import types
-
-    approval = types.ModuleType("tools.approval")
-    if notify:
-        approval._gateway_notify_cb = lambda session_key: None
-    gate = types.ModuleType("tools.approval_gateway_wait")
-    if wait:
-        gate._await_gateway_decision = lambda *a, **k: {}
-    monkeypatch.setitem(sys.modules, "tools.approval", approval)
-    monkeypatch.setitem(sys.modules, "tools.approval_gateway_wait", gate)
-
-
 # ------------------------------------------- health: private symbols ---
-
-
-def test_health_passes_when_gateway_symbols_exist(env, monkeypatch):
-    _fake_approval_modules(monkeypatch)
-    assert env.plugin._health()["gateway_approval"] == (True, "")
-
-
-@pytest.mark.parametrize("kw", [dict(notify=False), dict(wait=False)])
-def test_health_flags_missing_gateway_symbol(env, monkeypatch, kw):
-    _fake_approval_modules(monkeypatch, **kw)
-    assert env.plugin._health()["gateway_approval"][0] is False
-    env.plugin._run_health()
-    text = env.plugin._health_text()
-    assert "gateway_approval" in text and "cacheguard cannot show the box here: it only warns." in text
-    assert "cacheguard cannot show the box here: it only warns." in env.plugin._H["noticed"]
-    assert not any("gateway_approval" in line or "_await_gateway" in line for line in env.notices)
 
 
 def test_health_skips_cli_object_symbols(env):
     assert not any("modal" in name or "lock" in name for name in env.plugin._health())
 
 
-@pytest.mark.parametrize("name, symbol", [
-    ("usage_api", "normalize_usage"), ("session_key", "get_current_session_key")])
+@pytest.mark.parametrize("name, symbol", [("usage_api", "normalize_usage")])
 def test_health_checks_the_other_hermes_symbols(env, monkeypatch, name, symbol):
     monkeypatch.setattr(env.plugin, "_has_symbol", lambda mod, sym: True)
     assert env.plugin._health()[name][0] is True
@@ -133,14 +102,15 @@ def test_symbol_check_does_not_import_the_module(env, tmp_path, monkeypatch):
 
 
 def test_symbol_check_of_a_loaded_module_asks_the_module(env):
-    assert env.plugin._has_symbol("tools.approval", "_gateway_notify_cb") is True
-    assert env.plugin._has_symbol("tools.approval", "gone") is False
+    assert env.plugin._has_symbol("hermes_constants", "get_hermes_home") is True
+    assert env.plugin._has_symbol("hermes_constants", "gone") is False
 
 
 @pytest.mark.parametrize("name, module, table", [
     ("middleware", "hermes_cli.middleware", "VALID_MIDDLEWARE"),
     ("llm_request", "hermes_cli.middleware", "VALID_MIDDLEWARE"),
     ("transform_llm_output", "hermes_cli.plugins", "VALID_HOOKS"),
+    ("pre_llm_call", "hermes_cli.plugins", "VALID_HOOKS"),
 ])
 def test_health_flags_a_middleware_or_hook_name_hermes_no_longer_lists(env, monkeypatch, name, module, table):
     import sys
@@ -171,10 +141,10 @@ def test_each_new_health_check_is_listed_and_detects_a_rename(env, monkeypatch, 
 
 
 def test_renamed_symbol_prints_a_degraded_line_and_the_message_is_still_sent(env, monkeypatch):
-    monkeypatch.setattr(env.plugin, "_has_symbol", lambda mod, sym: sym != "get_current_session_key")
+    monkeypatch.setattr(env.plugin, "_has_symbol", lambda mod, sym: sym != "normalize_usage")
     env.plugin._run_health()
-    assert any(line.endswith("cacheguard cannot show the box here: it only warns.") for line in env.notices)
-    assert not any("degraded" in line or "session_key" in line for line in env.notices)
+    assert any(line.endswith("cacheguard cannot read cache numbers: results may be missing.") for line in env.notices)
+    assert not any("degraded" in line or "usage_api" in line for line in env.notices)
     _out, called, _sentinel = run_middleware(env, request={"messages": [{"role": "user", "content": "hi"}], "tools": []})
     assert called is True
 
