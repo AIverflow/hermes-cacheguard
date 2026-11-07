@@ -228,7 +228,8 @@ def _message_text(msg: dict[str, Any]) -> str | None:
 
 
 def _is_blocked_reply(msg: Any) -> bool:
-    """An assistant message that is one of our BLOCKED texts (never produced by the model)."""
+    """An assistant message shaped like one of our BLOCKED texts. The shape alone is not enough:
+    a model can write it too. It is ours only right after Hermes's withheld row (see _clean_history)."""
     if not isinstance(msg, dict) or msg.get("role") != "assistant" or msg.get("tool_calls"):
         return False
     text = _message_text(msg)
@@ -254,6 +255,18 @@ def _drop_withheld(text: str) -> str:
     if config._WITHHELD not in text:
         return text
     return "\n\n".join(p for p in text.split("\n\n") if p.split("\n")[-1] != config._WITHHELD)
+
+
+def _has_withheld(item: Any) -> bool:
+    """True for a typed user row that holds Hermes's withheld line (string content or text parts)."""
+    if not _is_plain_user(item):
+        return False
+    content = item.get("content")
+    if isinstance(content, str):
+        return config._WITHHELD in content
+    return isinstance(content, list) and any(
+        isinstance(p, dict) and p.get("type") in _WITHHELD_PART_TYPES
+        and isinstance(p.get("text"), str) and config._WITHHELD in p["text"] for p in content)
 
 
 def _without_withheld(item: Any) -> Any:
@@ -287,16 +300,20 @@ def _without_withheld(item: Any) -> Any:
 
 
 def _clean_history(items: list[Any]) -> list[Any]:
-    """The history without our BLOCKED replies: each one is dropped with the question it answered
-    (the web UI saves two rows for it: the typed text, then Hermes's withheld placeholder).
+    """The history without our BLOCKED replies. A reply is ours only right after a row with Hermes's
+    withheld line: it is dropped with that row, and with the typed row above it (the web UI saves two).
     Withheld lines merged into a row that stays (after a web UI /retry) are cut out of it."""
     out: list[Any] = []
+    previous: Any = None  # the last row kept, as it came in
     for item in items:
-        if _is_blocked_reply(item):
-            while out and _is_plain_user(out[-1]):
-                out.pop()  # the question was never sent to the model
+        if _is_blocked_reply(item) and _has_withheld(previous):
+            out.pop()  # the withheld row: the message was never sent to the model
+            if out and _is_plain_user(out[-1]):
+                out.pop()  # the web UI's typed row
+            previous = None
             continue
         out.append(_without_withheld(item))
+        previous = item
     return out
 
 

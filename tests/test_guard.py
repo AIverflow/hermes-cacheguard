@@ -490,24 +490,30 @@ def _req(p, msgs, key="messages"):
 def test_request_blocked_pair_removed_and_normal_pairs_kept(env):
     p = env.plugin
     msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "A"},
-            {"role": "user", "content": "big"}, {"role": "assistant", "content": _blocked(p)},
+            {"role": "user", "content": HELD}, {"role": "assistant", "content": _blocked(p)},
             {"role": "user", "content": "b"}, {"role": "assistant", "content": "B"}]
     out = _req(p, msgs)["request"]["messages"]
     assert [m["content"] for m in out] == ["a", "A", "b", "B"]
 
 
-def test_request_blocked_without_user_before_removes_only_assistant(env):
+def test_request_blocked_looking_reply_after_a_real_question_is_kept(env):
+    """A model can write the BLOCKED text itself: it is ours only right after Hermes's withheld row."""
     p = env.plugin
-    msgs = [{"role": "assistant", "content": "A"}, {"role": "assistant", "content": _blocked(p)},
-            {"role": "user", "content": "b"}]
-    out = _req(p, msgs)["request"]["messages"]
-    assert [m["content"] for m in out] == ["A", "b"]
+    msgs = [{"role": "user", "content": "what does the block say?"}, {"role": "assistant", "content": _blocked(p)},
+            {"role": "user", "content": "thanks"}]
+    assert _req(p, msgs) is None
+
+
+def test_request_blocked_looking_reply_at_the_start_is_kept(env):
+    p = env.plugin
+    msgs = [{"role": "assistant", "content": _blocked(p)}, {"role": "user", "content": "b"}]
+    assert _req(p, msgs) is None
 
 
 def test_request_is_idempotent_and_prefix_stable(env):
     p = env.plugin
     h1 = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "A"},
-          {"role": "user", "content": "big"}, {"role": "assistant", "content": _blocked(p)}]
+          {"role": "user", "content": HELD}, {"role": "assistant", "content": _blocked(p)}]
     h2 = h1 + [{"role": "user", "content": "c"}, {"role": "assistant", "content": "C"}]
     c1 = _req(p, h1)["request"]["messages"]
     assert _req(p, c1) is None  # already clean
@@ -539,7 +545,7 @@ def test_request_part_lists_chat_and_anthropic(env):
     def parts(t):
         return [{"type": "text", "text": t}]
     msgs = [{"role": "user", "content": parts("a")}, {"role": "assistant", "content": parts("A")},
-            {"role": "user", "content": parts("big")}, {"role": "assistant", "content": parts(_blocked(p))}]
+            {"role": "user", "content": parts(HELD)}, {"role": "assistant", "content": parts(_blocked(p))}]
     out = _req(p, msgs)["request"]["messages"]
     assert out == [msgs[0], msgs[1]]
 
@@ -550,7 +556,7 @@ def test_request_codex_input_shapes(env):
         return [{"type": "output_text", "text": t}]
     items = [{"role": "user", "content": "a"},
              {"type": "message", "role": "assistant", "status": "completed", "content": ot("A")},
-             {"role": "user", "content": [{"type": "input_text", "text": "big"}]},
+             {"role": "user", "content": [{"type": "input_text", "text": HELD}]},
              {"type": "message", "role": "assistant", "content": ot(_blocked(p))},
              {"type": "function_call_output", "call_id": "c", "output": "x"}]
     out = _req(p, items, key="input")["request"]["input"]
@@ -560,7 +566,7 @@ def test_request_codex_input_shapes(env):
 def test_request_tool_result_before_blocked_is_kept(env):
     p = env.plugin
     msgs = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "r"}]},
-            {"role": "assistant", "content": _blocked(p)}]
+            {"role": "user", "content": HELD}, {"role": "assistant", "content": _blocked(p)}]
     out = _req(p, msgs)["request"]["messages"]
     assert len(out) == 1 and out[0]["role"] == "user"
 
@@ -816,7 +822,7 @@ def test_hash_function_crash_does_not_touch_the_request(env, monkeypatch):
     p = env.plugin
     monkeypatch.setattr(p, "_hash_messages", lambda *a: 1 / 0)
     msgs = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "A"},
-            {"role": "user", "content": "big"}, {"role": "assistant", "content": p._block_text(60000, "p/m1", None, 700.0, "s")}]
+            {"role": "user", "content": HELD}, {"role": "assistant", "content": p._block_text(60000, "p/m1", None, 700.0, "s")}]
     out = p._on_llm_request(request={"messages": msgs}, session_id="s", platform="cli")
     assert out["request"]["messages"] == msgs[:2]  # still cleaned
     assert _call(env, _msgs(4), 1)["cause"] == "start"
@@ -934,6 +940,7 @@ def _history(p):
         {"role": "user", "content": [{"type": "text", "text": "Now list hotels"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "Hotels:\n1. Ace\n2. Bay" + note}]},
         {"role": "user", "content": "Book the cheapest one."},
+        {"role": "user", "content": p._WITHHELD},
         {"role": "assistant", "content": blocked},
         {"role": "user", "content": "Book the cheapest one."},
         {"role": "assistant", "content": None, "tool_calls": [
@@ -971,6 +978,7 @@ def test_growing_history_keeps_identical_cleaned_prefix(env):
         {"role": "user", "content": "Thanks"},
         {"role": "assistant", "content": "Welcome." + "\n\n" + p._PREFIX + " result: 2k reused"},
         {"role": "user", "content": "Bye"},
+        {"role": "user", "content": p._WITHHELD},
         {"role": "assistant", "content": p._block_text(60000, "p/m1", None, 900.0, "s1")},
         {"role": "user", "content": "Bye"},
         {"role": "assistant", "content": "Bye!"},
@@ -1466,6 +1474,13 @@ def test_clean_history_drops_the_web_ui_typed_row_too(env):
         {"role": "assistant", "content": reply}, {"role": "user", "content": "question two"},
     ]
     assert env.plugin._clean_history(items) == [items[0], items[1], items[5]]
+
+
+def test_clean_history_drops_only_the_withheld_row_and_the_typed_row_above(env):
+    reply = env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,000 tokens may be rebilled" + RETRY_LINE
+    items = [{"role": "user", "content": "unanswered"}, {"role": "user", "content": "typed"},
+             {"role": "user", "content": HELD}, {"role": "assistant", "content": reply}]
+    assert env.plugin._clean_history(items) == [items[0]]
 
 
 def test_withheld_line_matches_hermes_text(env):
