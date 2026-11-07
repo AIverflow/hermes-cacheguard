@@ -54,7 +54,7 @@ def test_unbounded_config_number_falls_back_without_raising(env):
 def test_defaults_keys_are_frozen(env):
     # A new setting needs the maintainer's explicit OK (AGENTS.md): change this list only when asked.
     assert sorted(env.plugin.DEFAULTS) == sorted([
-        "cli", "desktop", "gateway", "display_on_success", "block_images", "tiny_block", "size_k", "pause_m", "journal_rows", "chat_files"])
+        "cli", "desktop", "gateway", "display_on_success", "block_images", "tiny_block", "size_k", "pause_m", "journal_rows", "chat_files", "models"])
 
 
 @pytest.mark.parametrize("bad", [0, -5, 2.5, "many", True, "10000"])
@@ -151,3 +151,82 @@ def test_tiny_block_is_off_by_default_and_can_be_on(env):
     assert env.plugin._cfg()["tiny_block"] is False
     env.config["tiny_block"] = True
     assert env.plugin._cfg()["tiny_block"] is True
+
+
+# ---------------------------------------------------------------- models --
+
+
+def test_models_is_empty_by_default(env):
+    assert env.plugin._cfg()["models"] == []
+    assert not env.plugin._H["config_errors"]
+
+
+def test_valid_models_lines_are_kept(env):
+    lines = [{"model": "p/m1", "mode": "warn"}, {"model": "q/m2", "pause_m": 5, "size_k": 30}]
+    env.settings = {"models": lines}
+    assert env.plugin._cfg()["models"] == lines
+    assert not env.plugin._H["config_errors"]
+
+
+@pytest.mark.parametrize("bad", ["p/m1", {"model": "p/m1"}, 3, None])
+def test_models_that_is_not_a_list_falls_back_to_default(env, bad):
+    env.settings = {"models": bad}
+    assert env.plugin._cfg()["models"] == []
+    assert "invalid models; using default" in env.plugin._H["config_errors"]
+
+
+@pytest.mark.parametrize("bad", [
+    "p/m1", {"mode": "warn"}, {"model": "m1"}, {"model": 3}, {"model": "p/m1", "color": "red"},
+    {"model": "p/m1", "pause_m": 0.5}, {"model": "p/m1", "size_k": 3000}, {"model": "p/m1", "pause_m": True},
+    {"model": "p/m1", "mode": "maybe"}, {"model": "p/m1", "mode": True}])
+def test_bad_models_line_is_dropped_and_the_rest_kept(env, bad):
+    good = {"model": "q/m2", "mode": "warn"}
+    env.settings = {"models": [bad, good]}
+    assert env.plugin._cfg()["models"] == [good]
+    assert env.plugin._H["config_errors"] == {"invalid models line; ignored"}
+
+
+def test_unquoted_yaml_off_in_a_models_line_means_off(env):
+    import yaml
+    env.settings = {"models": yaml.safe_load("- {model: p/m1, mode: off}")}
+    assert env.settings["models"][0]["mode"] is False
+    assert env.plugin._cfg()["models"] == [{"model": "p/m1", "mode": "off"}]
+    assert not env.plugin._H["config_errors"]
+
+
+def _model_cfg(env, line, **groups):
+    cfg = {**env.plugin.DEFAULTS, **groups, "models": [line]}
+    return env.plugin._model_cfg(cfg, "p/m1"), cfg
+
+
+def test_model_cfg_without_a_matching_line_is_the_same_cfg(env):
+    cfg = {**env.plugin.DEFAULTS, "models": [{"model": "p/other", "mode": "off"}]}
+    assert env.plugin._model_cfg(cfg, "p/m1") is cfg
+    assert env.plugin._model_cfg(env.plugin.DEFAULTS, "p/m1") is env.plugin.DEFAULTS
+
+
+def test_model_cfg_match_is_exact(env):
+    cfg = {**env.plugin.DEFAULTS, "models": [{"model": "p/m1", "pause_m": 3}]}
+    for key in ("p/m", "p/m11", "x/p/m1", "P/m1"):
+        assert env.plugin._model_cfg(cfg, key) is cfg
+
+
+def test_model_cfg_overrides_pause_and_size_only(env):
+    out, cfg = _model_cfg(env, {"model": "p/m1", "pause_m": 3}, cli="block")
+    assert out["pause_m"] == 3 and out["size_k"] == cfg["size_k"] and out["cli"] == "block"
+    assert cfg["pause_m"] == 10  # the global cfg is not changed
+    out, _ = _model_cfg(env, {"model": "p/m1", "size_k": 5})
+    assert out["size_k"] == 5 and out["pause_m"] == 10
+
+
+@pytest.mark.parametrize("group, line", [
+    ("block", "warn"), ("warn", "block"), ("block", "block"), ("block", "off"), ("warn", "off"), ("off", "block"),
+    ("off", "warn"), ("off", "off")])
+def test_model_cfg_mode_replaces_the_group_mode_unless_the_group_is_off(env, group, line):
+    out, _ = _model_cfg(env, {"model": "p/m1", "mode": line}, cli=group, desktop=group, gateway=group)
+    assert [out[k] for k in ("cli", "desktop", "gateway")] == ["off" if group == "off" else line] * 3
+
+
+def test_model_cfg_mode_skips_only_the_groups_that_are_off(env):
+    out, _ = _model_cfg(env, {"model": "p/m1", "mode": "block"}, cli="warn", desktop="block", gateway="off")
+    assert (out["cli"], out["desktop"], out["gateway"]) == ("block", "block", "off")

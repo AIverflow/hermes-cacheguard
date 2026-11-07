@@ -43,6 +43,7 @@ def _on_llm_execution(**kwargs: Any) -> Any:
         _start_turn(sid)
     try:
         cfg = config._cfg()
+        cfg = config._model_cfg(cfg, config._model_key(kwargs.get("provider"), kwargs.get("model")))
         surface_mode = config._surface_mode(kwargs, cfg)
         triggered = None if auxiliary else _evaluate(kwargs, cfg, surface_mode)
         if triggered:
@@ -499,23 +500,28 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
         # The web UI's /retry sends Hermes's withheld line in place of the blocked text (kept in the row above).
         if held is not None and isinstance(text, str) and (held == _text_hash(text) or text == config._WITHHELD):
             return None  # the resend of the message just blocked
+        if not isinstance(sid, str) or not sid or not isinstance(text, str):
+            return None
         cfg = config._cfg()
+        if not cfg["models"] and config._surface_mode(kwargs, cfg) != "block":
+            return None  # nothing to look up: no chat file read
+        # Hermes gives only the model name here: the provider is the one the chat last used.
+        rec = storage._get_session(sid)
+        stored = rec.get("model")
+        provider = stored.split("/", 1)[0] if isinstance(stored, str) else None
+        cfg = config._model_cfg(cfg, config._model_key(provider, kwargs.get("model")))
         if config._surface_mode(kwargs, cfg) != "block" or confirm._single_query():
             return None
         history = kwargs.get("conversation_history")
-        if not isinstance(sid, str) or not sid or not isinstance(text, str):
-            return None
         if not isinstance(history, list) or not history or not isinstance(history[-1], dict):
             return None
         content = history[-1].get("content")
         image = _message_text(history[-1]) is None
         if image and (not isinstance(content, list) or not cfg["block_images"]):
             return None  # an image or other media: /retry refuses it, so only a warning (unless block_images)
-        rec = storage._get_session(sid)
-        stored = rec.get("model")
         payload = {
             "session_id": sid, "platform": kwargs.get("platform"), "api_call_count": 1,
-            "provider": stored.split("/", 1)[0] if isinstance(stored, str) else None,
+            "provider": provider,
             "model": kwargs.get("model"), "api_mode": rec.get("api_mode"),
             "request": {"messages": history},
         }

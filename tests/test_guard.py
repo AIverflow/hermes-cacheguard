@@ -1444,6 +1444,95 @@ def test_hook_garbage_arguments_let_it_go(env):
     assert env.plugin._on_pre_llm_call(session_id=["bad"], user_message=3) is None
 
 
+# ------------------------------------------------------- per-model lines --
+
+
+def test_model_line_with_a_short_pause_warns_where_the_global_one_would_not(env):
+    env.config["cli"] = "warn"
+    seed_session(env, ago=300)  # 5 minutes: under the global 10
+    run_middleware(env)
+    assert env.warned() is None
+    env.config["models"] = [{"model": "p/m1", "pause_m": 3}]
+    seed_session(env, ago=300)  # the first call moved the chat's clock
+    run_middleware(env)
+    assert env.warned() is not None
+
+
+def test_model_line_of_another_model_changes_nothing(env):
+    env.config.update(cli="warn", models=[{"model": "p/other", "pause_m": 3}, {"model": "q/m1", "pause_m": 3}])
+    seed_session(env, ago=300)
+    run_middleware(env)
+    assert env.warned() is None
+
+
+def test_model_line_mode_off_shows_nothing_but_the_observation_is_recorded(env, monkeypatch):
+    from types import SimpleNamespace
+    env.config.update(cli="warn", models=[{"model": "p/m1", "mode": "off"}])
+    now = [100.0]
+    monkeypatch.setattr(env.plugin.time, "time", lambda: now[0])
+    _send_observed(env, session_id="s1", model="m1", provider="p", platform="cli", usage=_usage(60000, 59000))
+    now[0] = 3700.0
+    response = SimpleNamespace(usage=_usage(60000, 59000))
+    env.plugin._on_llm_execution(next_call=lambda: response, request=big_request(), session_id="s1", model="m1",
+                                 provider="p", api_call_count=1, api_mode="chat_completions", platform="cli")
+    assert env.warned() is None and env.plugin._PENDING == {}
+    assert [row["gap_s"] for row in env.plugin._read_observations()] == [3600.0]
+
+
+def test_model_line_mode_warn_is_never_blocked(env):
+    _blockable(env)
+    assert _hook(env)["action"] == "block"
+    env.plugin._HELD.clear()
+    env.config["models"] = [{"model": "p/m1", "mode": "warn"}]
+    assert _hook(env) is None
+    out, called, _ = run_middleware(env)
+    assert called and env.warned() is not None  # still warned
+
+
+def test_model_line_pause_changes_the_block_decision(env):
+    env.config["cli"] = "block"
+    seed_session(env, ago=300)
+    assert _hook(env) is None
+    env.config["models"] = [{"model": "p/m1", "pause_m": 3}]
+    assert _hook(env)["action"] == "block"
+    env.config["models"] = [{"model": "p/m1", "size_k": 500}]
+    seed_session(env, ago=3600)
+    assert _hook(env) is None  # the prompt is under this model's size
+
+
+def test_model_line_mode_block_does_not_block_where_the_group_is_off(env):
+    _blockable(env, mode="off")
+    env.config["models"] = [{"model": "p/m1", "mode": "block"}]
+    assert _hook(env) is None
+
+
+def test_model_line_mode_block_blocks_where_the_group_warns(env):
+    _blockable(env, mode="warn")
+    assert _hook(env) is None
+    env.config["models"] = [{"model": "p/m1", "mode": "block"}]
+    assert _hook(env)["action"] == "block"
+
+
+def test_model_line_mode_block_on_a_chat_platform_follows_the_gateway_group(env):
+    _blockable(env, mode="warn")
+    env.config.update(gateway="off", models=[{"model": "p/m1", "mode": "block"}])
+    assert _hook(env, platform="telegram") is None
+    env.config["gateway"] = "warn"
+    assert _hook(env, platform="telegram")["action"] == "block"
+
+
+def test_hook_without_model_lines_in_a_group_that_does_not_block_reads_no_chat_file(env, monkeypatch):
+    _blockable(env, mode="warn")
+    monkeypatch.setattr(env.plugin, "_get_session", lambda sid: 1 / 0)  # a read would raise
+    assert _hook(env) is None
+
+
+def test_model_line_of_another_provider_in_the_session_file_does_not_apply(env):
+    env.config["models"] = [{"model": "p/m1", "mode": "warn"}]
+    _blockable(env, model="other/m1")  # the chat last used another provider for this model name
+    assert _hook(env)["action"] == "block"
+
+
 def test_hook_leaves_the_middleware_to_warn(env):
     """After the hook let a message through, llm_execution warns in block mode: the provider is called."""
     _blockable(env)

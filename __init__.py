@@ -54,7 +54,7 @@ def register(ctx: Any) -> None:
             "cacheguard",
             commands._cmd_entry,
             description="Show cacheguard status. 'setup' and 'set' change settings; 'reset' clears saved history.",
-            args_hint="[help | all | <model> | setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k] | set <name> <value> | reset]",
+            args_hint="[help | all | <model> | setup <all|cli|desktop|gateway|model> <mode> [pause_m] [size_k] | set <name> <value> | set model <pause_m|size_k|mode|reset> [value] | reset]",
         )
     except Exception:
         pass

@@ -73,7 +73,7 @@ def test_summary_shows_every_setting(env, monkeypatch):
     line = env.plugin._cmd_show().splitlines()[1]
     assert line.startswith("tiny_block on  ·  block_images off") and line.endswith("chat_files 50")
     assert all(f"{name} " in line for name in env.plugin.DEFAULTS
-               if name not in ("cli", "desktop", "gateway", "pause_m", "size_k"))
+               if name not in ("cli", "desktop", "gateway", "pause_m", "size_k", "models"))
 
 
 @pytest.mark.parametrize("surface", ["telegram", "webui"])
@@ -95,10 +95,11 @@ def test_webui_without_a_named_surface_is_a_markdown_surface(env, monkeypatch):
 
 
 def test_command_takes_the_platform_the_way_hermes_passes_it(env):
-    # Hermes calls a handler with the keywords it names; `platform` must be one of them.
+    # Hermes calls a handler with the keywords it names; `platform` and `session_id` must be two of them.
     import inspect
     params = inspect.signature(env.plugin._cmd_entry).parameters
     assert params["platform"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["session_id"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_cmd_one_row_hides_old_rows(env):
@@ -344,7 +345,7 @@ def test_unknown_arguments_are_named(env):
 def test_bad_input_on_every_subcommand_gets_usage(env):
     assert env.plugin._cmd_show("setup").startswith("usage: /cacheguard setup")
     assert env.plugin._cmd_show("setup nope warn").startswith(
-        "cacheguard: Unknown group nope; use all, cli, desktop or gateway.")
+        "cacheguard: Unknown group nope; use all, cli, desktop, gateway or model.")
     assert env.plugin._cmd_show("set").startswith("usage: /cacheguard set")
     assert env.plugin._cmd_show("set cli maybe").startswith("cacheguard: cli must be")
 
@@ -441,3 +442,136 @@ def test_superscript_digits_in_command_args_do_not_crash(env):
 def test_help_example_sets_one_group(env):
     assert "/cacheguard setup cli block 10 20" in env.plugin._HELP_TEXT
     assert "setup all block 10 30" not in env.plugin._HELP_TEXT
+
+
+# -------------------------------------------------- /cacheguard set model -----
+
+
+def _set_model(env, args, session_id="s1"):
+    return env.plugin._cmd_entry("set model " + args, platform="cli", session_id=session_id)
+
+
+def test_set_model_adds_a_line_for_the_model_of_this_chat(env):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    assert _set_model(env, "mode off") == "cacheguard: p/m1 mode = off (saved to config)."
+    assert ctx.calls == [("models", [{"model": "p/m1", "mode": "off"}])]
+
+
+def test_set_model_overwrites_one_field_and_keeps_the_rest(env):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    env.settings["models"] = [{"model": "q/other", "pause_m": 3}, {"model": "p/m1", "mode": "warn", "pause_m": 5}]
+    assert _set_model(env, "pause_m 2") == "cacheguard: p/m1 pause_m = 2 min (saved to config)."
+    assert _set_model(env, "size_k 30") == "cacheguard: p/m1 size_k = 30k (saved to config)."
+    assert env.settings["models"] == [{"model": "q/other", "pause_m": 3},
+                                      {"model": "p/m1", "mode": "warn", "pause_m": 2, "size_k": 30}]
+    assert len(ctx.calls) == 2
+
+
+def test_set_model_reset_removes_only_this_line(env):
+    _with_ctx(env)
+    seed_session(env, model="p/m1")
+    env.settings["models"] = [{"model": "q/other", "pause_m": 3}, {"model": "p/m1", "mode": "warn"}]
+    assert _set_model(env, "reset") == "cacheguard: p/m1 uses the global settings (saved to config)."
+    assert env.settings["models"] == [{"model": "q/other", "pause_m": 3}]
+
+
+@pytest.mark.parametrize("session_id", ["", "unseen"])
+def test_set_model_without_a_model_in_this_chat_is_refused_and_writes_nothing(env, session_id):
+    ctx = _with_ctx(env)
+    seed_session(env, "other", model="p/m1")
+    for args in ("mode off", "reset"):
+        assert _set_model(env, args, session_id) == "cacheguard: no model seen in this chat yet; send a message first."
+    assert ctx.calls == []
+
+
+def test_set_model_without_a_session_id_is_refused(env):
+    ctx = _with_ctx(env)
+    assert env.plugin._cmd_show("set model mode off").startswith("cacheguard: no model seen in this chat yet")
+    assert ctx.calls == []
+
+
+@pytest.mark.parametrize("args, error", [
+    ("pause_m 0", "pause_m must be a number >= 1."), ("size_k 3000", "size_k is in thousands"),
+    ("mode maybe", "mode must be one of off, warn, block."), ("color red", None), ("mode", None), ("", None),
+    ("pause_m 1 2", None)])
+def test_set_model_with_a_bad_value_is_refused_and_writes_nothing(env, args, error):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    out = _set_model(env, args)
+    assert out.startswith("cacheguard: " + error) if error else out.startswith("usage: /cacheguard set")
+    assert "model <pause_m|size_k|mode>" in out and ctx.calls == []
+
+
+def test_set_model_write_failure_is_reported(env):
+    _with_ctx(env, fail=True)
+    seed_session(env, model="p/m1")
+    assert _set_model(env, "mode off").startswith("cacheguard: could not write models (")
+
+
+def _setup_model(env, args, session_id="s1"):
+    return env.plugin._cmd_entry("setup model " + args, platform="cli", session_id=session_id)
+
+
+def test_setup_model_writes_mode_pause_and_size_in_one_save(env):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    assert _setup_model(env, "block 10 50") == (
+        "cacheguard: p/m1 · mode = block · pause ≥ 10 min · size ≥ 50k (this model only; saved to config).")
+    assert ctx.calls == [("models", [{"model": "p/m1", "mode": "block", "pause_m": 10, "size_k": 50}])]
+
+
+def test_setup_model_with_a_mode_only_keeps_pause_and_size_of_the_line(env):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    env.settings["models"] = [{"model": "p/m1", "mode": "warn", "pause_m": 5}, {"model": "q/other", "size_k": 3}]
+    assert _setup_model(env, "off") == "cacheguard: p/m1 · mode = off (this model only; saved to config)."
+    assert env.settings["models"] == [{"model": "q/other", "size_k": 3}, {"model": "p/m1", "mode": "off", "pause_m": 5}]
+    assert len(ctx.calls) == 1
+
+
+def test_setup_model_merges_with_the_existing_line(env):
+    _with_ctx(env)
+    seed_session(env, model="p/m1")
+    env.settings["models"] = [{"model": "p/m1", "mode": "warn", "pause_m": 5, "size_k": 9}]
+    _setup_model(env, "block 2 4")
+    assert env.settings["models"] == [{"model": "p/m1", "mode": "block", "pause_m": 2, "size_k": 4}]
+
+
+@pytest.mark.parametrize("session_id", ["", "unseen"])
+def test_setup_model_without_a_model_in_this_chat_is_refused_and_writes_nothing(env, session_id):
+    ctx = _with_ctx(env)
+    seed_session(env, "other", model="p/m1")
+    assert _setup_model(env, "block 10 50", session_id) == "cacheguard: no model seen in this chat yet; send a message first."
+    assert ctx.calls == []
+
+
+@pytest.mark.parametrize("args, start", [
+    ("block 10", "cacheguard: Give both pause and size"), ("maybe", "cacheguard: mode must be off, warn or block."),
+    ("block 0 20", "cacheguard: pause_m must be a number >= 1."), ("block 10 3000", "cacheguard: size_k is in thousands"),
+    ("block 10 20 5", "usage: /cacheguard setup"), ("", "usage: /cacheguard setup")])
+def test_setup_model_with_a_bad_value_is_refused_and_writes_nothing(env, args, start):
+    ctx = _with_ctx(env)
+    seed_session(env, model="p/m1")
+    assert _setup_model(env, args).startswith(start)
+    assert ctx.calls == []
+
+
+def test_setup_model_write_failure_is_reported(env):
+    _with_ctx(env, fail=True)
+    seed_session(env, model="p/m1")
+    assert _setup_model(env, "block").startswith("cacheguard: could not write models (")
+
+
+def test_summary_shows_the_model_lines_after_the_settings(env):
+    env.settings["models"] = [{"model": "p/m1", "mode": "off"},
+                              {"model": "q/m2", "pause_m": 5, "size_k": 30, "mode": "warn"}]
+    lines = env.plugin._cmd_show().splitlines()
+    assert lines[2:4] == ["p/m1: mode off", "q/m2: pause 5 min, size 30k, mode warn"]
+    assert lines[4] == "" and lines[5].startswith("setup:")
+
+
+def test_help_lists_set_model(env):
+    assert "  model <pause_m|size_k|mode> <value>" in env.plugin._HELP_TEXT
+    assert "  model reset" in env.plugin._HELP_TEXT

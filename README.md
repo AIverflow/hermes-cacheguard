@@ -37,6 +37,7 @@ Hermes refuses a cacheguard version that is too new for it. Pick the version tha
 
 | cacheguard | Hermes | Git tag |
 |---|---|---|
+| 0.6.0 | 0.22.6 or newer | `v0.6.0` |
 | 0.5.0 | 0.22.6 or newer | `v0.5.0` |
 | 0.4.0 | 0.22.5 or newer | `v0.4.0` |
 | 0.3.0 | 0.22.3 or newer | `v0.3.0` |
@@ -80,7 +81,7 @@ To block first in every group after a 10-minute pause, for chats of 20k tokens o
 
     /cacheguard setup all block 10 20
 
-Format: `setup <group> <mode> [pause_m] [size_k]`.
+Format: `setup <group|model> <mode> [pause_m] [size_k]`.
 
 - Groups: `cli` (terminal, editor), `desktop` (desktop app, web UI), `gateway` (messaging platforms), `all`.
 - Modes: `off`, `warn` (report afterwards), `block` (stop first; you send it with `/retry`).
@@ -89,6 +90,12 @@ Format: `setup <group> <mode> [pause_m] [size_k]`.
 To change only the pause, here to 1 minute:
 
     /cacheguard set pause_m 1
+
+One model can have its own values. In a chat that uses it:
+
+    /cacheguard set model mode warn
+
+That model is then never blocked, only warned. Pause and size work too: `/cacheguard set model pause_m 5`. See [per-model settings](docs/guide.md#per-model-settings).
 
 Two limits count items, not days. Defaults: `journal_rows 10000` (most calls kept in the stats) and `chat_files 200` (most chats that keep a tracking file). Change one with `/cacheguard set journal_rows 5000`.
 
@@ -139,8 +146,9 @@ Small chats and short pauses stay silent. The lines are not sent to the model ([
 | Command | What it does |
 |---|---|
 | `/cacheguard` | Every setting, and a table: how often the cache was lost, by pause length |
-| `/cacheguard setup <group> <mode> [pause_m] [size_k]` | Set mode, pause and size (`pause_m` and `size_k`: both or neither) |
+| `/cacheguard setup <group\|model> <mode> [pause_m] [size_k]` | Set mode, pause and size (`pause_m` and `size_k`: both or neither); `model` = the model of this chat only |
 | `/cacheguard set <name> <value>` | Change one setting |
+| `/cacheguard set model <pause_m\|size_k\|mode\|reset> [value]` | Own setting for the model of this chat |
 | `/cacheguard help` | Every command |
 
 ## Safe by default

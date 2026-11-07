@@ -20,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
     "pause_m": 10,
     "journal_rows": 10000,  # most calls kept in the journal (a count, not days)
     "chat_files": 200,  # most chat tracking files kept, newest first
+    "models": [],  # lines {model: provider/model, pause_m, size_k, mode} that replace the global values for one model
 }
 
 
@@ -82,6 +83,28 @@ def _surface_mode(payload: dict[str, Any], cfg: dict[str, Any]) -> Any:
     return cfg["cli"] if _is_cli_or_desktop(payload) else cfg["gateway"]
 
 
+_MODES = ("off", "warn", "block")
+
+
+def _model_cfg(cfg: dict[str, Any], model_key: str) -> dict[str, Any]:
+    """The settings for one model: a copy of cfg with its line applied (cfg itself when it has none).
+
+    The line's mode replaces the mode of every group, except a group that is off: off wins on both sides.
+    """
+    line = next((x for x in cfg.get("models") or [] if x["model"] == model_key), None)
+    if line is None:
+        return cfg
+    out = dict(cfg)
+    for key in ("pause_m", "size_k"):
+        if key in line:
+            out[key] = line[key]
+    if "mode" in line:
+        for group in ("cli", "desktop", "gateway"):
+            if out[group] != "off":
+                out[group] = line["mode"]
+    return out
+
+
 def _finite_number(value: Any) -> bool:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
@@ -125,6 +148,23 @@ def _size_tokens(size_k: Any) -> int:
     return round(float(size_k) * 1000)
 
 
+def _valid_model_line(line: Any) -> dict[str, Any] | None:
+    """A copy of one `models` line, or None when it is not valid. YAML reads an unquoted `off` as False."""
+    if not isinstance(line, dict) or not isinstance(line.get("model"), str) or "/" not in line["model"]:
+        return None
+    out = dict(line)
+    if out.get("mode") is False:
+        out["mode"] = "off"
+    for key, value in out.items():
+        if key == "mode":
+            ok = isinstance(value, str) and value in _MODES
+        else:
+            ok = key == "model" or (key in ("pause_m", "size_k") and _valid_number(key, value))
+        if not ok:
+            return None
+    return out
+
+
 def _cfg() -> dict[str, Any]:
     cfg = dict(DEFAULTS)
     errors = set()
@@ -157,6 +197,13 @@ def _cfg() -> dict[str, Any]:
     for key in ("journal_rows", "chat_files"):
         if not _valid_count(cfg[key]):
             invalid(key)
+    if not isinstance(cfg["models"], list):
+        invalid("models")
+    else:
+        lines = [_valid_model_line(line) for line in cfg["models"]]
+        if None in lines:
+            errors.add("invalid models line; ignored")
+        cfg["models"] = [line for line in lines if line is not None]
     _set_config_errors(errors)
     return cfg
 

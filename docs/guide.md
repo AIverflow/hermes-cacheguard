@@ -32,6 +32,8 @@ DeepSeek as provider:
 
 - Measured: its cache lasts 3 days to a week, so this plugin makes less sense.
 
+A different pause for each model or provider: see [per-model settings](#per-model-settings).
+
 Once a large chat has gone cold, it often costs less to start over: type `/new`, then ask the new chat to read back the old session by its ID (for example the first and last messages). Hermes can read a session by its ID with its `session_search` tool.
 
 Sources: [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching), [OpenRouter prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching), [DeepSeek context caching](https://api-docs.deepseek.com/guides/kv_cache/).
@@ -69,6 +71,30 @@ Set them with `/cacheguard set <name> <value>`, or in `<hermes home>/config.yaml
 | `size_k` | number, 0 to 2000, in thousands of tokens (`20` = 20k) | 20 | Smallest prompt to act on |
 | `journal_rows` | whole number, 1 or more | 10000 | Most calls kept in the stats (a count, not days) |
 | `chat_files` | whole number, 1 or more | 200 | Most chats that keep a tracking file, newest first |
+| `models` | list of lines | none | Own pause, size or mode for single models, see below |
+
+### Per-model settings
+
+A model can have its own pause, size or mode. A line names the model as `provider/model`, exactly as in the `/cacheguard` table, and sets any of `pause_m`, `size_k`, `mode`. What a line does not set stays global.
+
+```yaml
+plugins:
+  entries:
+    cacheguard:
+      settings:
+        models:
+          - {model: deepseek/deepseek-v4-flash, mode: "off"}
+          - {model: openrouter/deepseek/deepseek-v4-flash, pause_m: 10}
+          - {model: anthropic/claude-opus-5-5, pause_m: 5, size_k: 30}
+```
+
+In a chat, `/cacheguard set model pause_m 5` writes the line for the model of that chat, and `/cacheguard set model reset` removes it. `/cacheguard` lists the lines under the settings. To set mode, pause and size of the line in one go: `/cacheguard setup model block 10 50`.
+
+- The name must match exactly, with no `*`. The same model at two providers is two lines.
+- A line beats the global value. Pause and size are used as given.
+- A line's `mode` replaces the mode of every group that is not off: `mode: block` blocks that model where its group warns; `mode: warn` never blocks it; `mode: "off"` shows nothing, but its calls are still recorded in the stats. A group set to off stays off.
+- A line that is not valid is ignored, and `/cacheguard` says so on a `health: degraded` line.
+- Known limit: when a message is checked for a block, Hermes gives only the model name, so the provider is the one the chat used last. After you switch provider and keep the same model name, the first message uses the old provider's line.
 
 Other commands:
 
@@ -104,17 +130,23 @@ A call lost the cache when at least 30% of the previous prompt was not read from
 - Not counted: pauses under 1 minute, the first call of a chat, model switches, calls where the chat itself changed (`context changed`), background calls.
 - `context changed`: the start of the chat was not what the last call sent, for example Hermes edited an old message. cacheguard compares a fingerprint of the messages, kept in the chat's file (the messages themselves are not stored, and nothing is sent to the provider). Cache markers are ignored; the system prompt and tool list are not compared, unless they are in the message list. A call that shrank the prompt by more than 5% also counts as `context changed`.
 - Columns shorter than `pause_m` are for information only: the guard does not act there.
-- The columns show what was observed, not provider cache lifetimes. One `pause_m` covers every model.
+- The columns show what was observed, not provider cache lifetimes. One `pause_m` covers every model, unless the model has its own line.
 - The table shows from 5 measurements in all. Before that, it says `(3 measurements so far, need at least 5)`.
 - `/cacheguard all` shows every model with at least one counted pause, not only the top 10. Models with none are left out.
 
 
 ## The block text and the result line
 
-The basics are in the [README](../README.md#using-it). A few more things:
+The basics are in the [README](../README.md#using-it). More:
 
-- cacheguard acts on your message when the chat paused longer than `pause_m` and is at least `size_k` tokens. After a model change, no pause is needed.
-- Block means the message is not sent, and the reply starts with `[CACHEGUARD] BLOCKED · `. Needs Hermes 0.22.6 or newer.
+**When it acts**
+
+- The chat paused at least `pause_m` and holds at least `size_k` tokens.
+- After a model change, no pause is needed.
+
+**The block text**
+
+- The message is not sent. The reply starts with `[CACHEGUARD] BLOCKED · `. Needs Hermes 0.22.6 or newer.
 - By default the text has 3 lines:
 
       [CACHEGUARD] BLOCKED · 13:05 · 12 minutes pause 🕐 · ~45,000 tokens may be rebilled · lost 3 of 4 similar pauses
@@ -124,28 +156,50 @@ The basics are in the [README](../README.md#using-it). A few more things:
 - `13:05` is the time of the block, on the clock of the machine running Hermes (a Telegram user in another time zone sees that machine's time).
 - After a model change the first line is `[CACHEGUARD] BLOCKED · 13:05 · model changed a → b · ~45,000 tokens may be rebilled`.
 - With `tiny_block on` it is one line: `[CACHEGUARD] BLOCKED · 13:05 · 12m 🕐 · ~45kt · 3/4` (`3/4`: lost 3 of 4 similar pauses). Start with the default; once you know the plugin, switch tiny on.
-- To send a blocked message: `/retry`, or send the same text again. That one resend goes out with no new check and no time limit. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
+- The model is compared by name only (the hook gets no provider). The provider comes from the model stored for the chat.
+
+**Sending a blocked message**
+
+- Use `/retry`, or send the same text again. That one resend goes out with no new check and no time limit.
+- In Telegram and other chats, `/retry` is a tappable command.
+- In the web UI, `/retry` shows `[Message withheld: …]` as your message. The model still gets the text you typed.
 - After a message is sent, the pause clock restarts: no new block until the next pause.
-- A message with an image is only warned, because Hermes' `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again.
+
+**Images**
+
+- A message with an image is only warned, because Hermes' `/retry` refuses images and the up arrow drops them.
+- With `block_images on` it is blocked too: attach the image again and send it again.
 - If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees only text and treats the message as text.
+
+**Runs with no screen**
+
 - `hermes chat -q` has no screen to read the reply, so `block` acts as `warn`.
 - `-Q`, `--oneshot` and `hermes -z` runs are left alone like background calls: no block, no line. A `-Q` run may still be counted in the stats.
-- The model is compared by name only (the hook gets no provider). The provider comes from the model stored for the chat.
-- When cacheguard cannot tell whether the cache held (first call of a chat, a model that does not report its cache, a call that read nothing from the cache before the model showed 2 cache hits…), the line says `cache unknown` and why, for example `cache unknown, needs 1 more cache hit`.
-- After a model change, a loss counts up to N tokens rebilled: the count includes your new message.
 
+**The result line**
+
+- When cacheguard cannot tell whether the cache held, the line says `cache unknown` and why, for example `cache unknown, needs 1 more cache hit`. This happens on the first call of a chat, with a model that does not report its cache, or after a call that read nothing from the cache before the model showed 2 cache hits…
+- After a model change, a loss counts up to N tokens rebilled: the count includes your new message.
 
 ## What the model sees
 
 The model never sees cacheguard's lines.
 
-- **Result lines and notices** are posted as short chat notices, outside the conversation. They start with `CGUARD` and the time, for example `CGUARD 13:05 23k reused, 1 min` or `CGUARD 13:05 WARN cache lost, 23k rebilled, 10 min`: the TUI status line cuts text at about 45 characters. Where they show: classic CLI, a dim line at the top of the reply; TUI, the status line at the bottom; Desktop and Web UI, a notification; Telegram, a separate bot message.
-- **BLOCKED replies** are real replies: Hermes saves them in the chat as if the model wrote them. Before each call, cacheguard removes every one of them from what is sent, with the message it answered, and the line `[Message withheld: …]` that Hermes saves in place of a blocked message. You still see them in the chat.
-- Only replies that start with `[CACHEGUARD] BLOCKED` are removed, always the same way, so the cache holds.
+**Result lines and notices**
+
+- They are posted as short chat notices, outside the conversation.
+- They start with `CGUARD` and the time, for example `CGUARD 13:05 23k reused, 1 min` or `CGUARD 13:05 WARN cache lost, 23k rebilled, 10 min`. They are short because the TUI status line cuts text at about 45 characters.
+- Where they show: classic CLI, a dim line at the top of the reply; TUI, the status line at the bottom; Desktop and Web UI, a notification; Telegram, a separate bot message.
+
+**BLOCKED replies**
+
+- Hermes saves them in the chat as real replies, as if the model wrote them. You still see them.
+
+**Good to know**
+
 - Installing, updating, or turning cacheguard off or on can change what is sent only in a chat that holds a BLOCKED reply or a `[Message withheld: …]` line: its next call may lose the cache once. Other chats keep it.
 - Hermes' chat summaries (compression) may still mention these lines.
 - If removing them fails, the call is sent unchanged.
-
 
 ## Unattended runs
 
@@ -173,18 +227,20 @@ To set it up, type `/cacheguard setup all block 10 20` in a chat started with `h
 
 If cacheguard fails, your message is sent.
 
-- `/cacheguard` shows a `health: degraded` line when something is wrong. No such line means all is fine.
-- Hermes changes often. At startup, cacheguard checks that the Hermes parts it uses still exist. If one moved, it prints one short sentence, once, and `/cacheguard` gives the details. It only reports: what cacheguard does stays the same. For example:
+- `/cacheguard` shows a `health: degraded` line, with the details, when something is wrong. No such line means all is fine.
+- Hermes changes often, so at startup cacheguard checks that the Hermes parts it uses still exist.
+- If one moved, cacheguard says so in one short sentence, once per chat. For example:
   - `cacheguard cannot block here: it only warns.`
   - `cacheguard lines may reach the model.`
   - `cacheguard is off: it could not start.`
-
+- It only reports: what cacheguard does stays the same.
 
 ## Known limits
 
 - Tested on Linux only. Windows is untested: testers welcome, please open an issue.
 - Tested in the terminal, desktop app, web UI and Telegram. Not tested: editor, other messaging platforms.
 - A warning is a guess, not proof that the cache expired.
+- A model line is chosen by model name and the chat's last provider: after a provider switch with the same model name, the first block check uses the old provider's line.
 - cacheguard counts tokens, not dollars.
 - Calls that bypass the Hermes middleware (e.g. `codex_app_server`) are not seen.
 

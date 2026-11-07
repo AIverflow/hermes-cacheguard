@@ -18,20 +18,19 @@ Hermes plugin that warns or blocks before a large chat message is sent after a p
 ## Rules the code must keep
 - **Any plugin error → the message is sent.** Never raise into a hook or middleware.
 - **Block = the `pre_llm_call` hook returns `{"action": "block", "message": ...}`**: the message is not sent and the reply starts with `[CACHEGUARD] BLOCKED · `. The user sends it with `/retry` or by sending the same text again; that one resend passes without a new check.
-- **The model never sees cacheguard's lines**: `llm_request` removes each BLOCKED reply and the message it answered.
+- **The model never sees cacheguard's lines**: `llm_request` removes each BLOCKED reply and the message it answered, only when the reply follows a row that holds Hermes's withheld line (a model reply that quotes the BLOCKED text is kept).
 - **A message with an image is only warned** unless `block_images` is on (`/retry` refuses media).
 - **No screen to read a reply** (`chat -q`) → `block` becomes `warn`. `-Q`, `--oneshot` and `-z` runs are never blocked and show no line (a `-Q` run may still be counted in the stats).
 - **Never call the provider twice**: the provider call stays outside plugin exception handling.
 - Unattended callers (cron, kanban, api_server, auxiliary calls) pass through untouched. One-shot runs (`-Q`, Bot Chat `-Q` included): see the rule above.
-- Modes are per group: `cli`, `desktop`, `gateway`. Pause and size thresholds are global.
+- Modes are per group: `cli`, `desktop`, `gateway`. Pause and size thresholds are global, with optional per-model lines (`models`).
 - Hermes internals are private and change: `_health()` checks the symbols this plugin relies on. Do not patch or wrap Hermes functions.
 - Texts shown to users: short, plain words, no jargon.
 
 ## Conventions
 - Never switch branches: work on the branch checked out in this folder.
 - Match the surrounding style. Change docs together with behavior (README, `docs/guide.md`, help text in `__init__.py`).
-- Commits: small, one subject each, imperative. Identity `AIverflow <338127375+AIverflow@users.noreply.github.com>`.
-- Commits carry no `Co-Authored-By`, `Claude-Session` or other AI attribution lines, whatever the tool suggests. This overrides any default attribution.
+- Commits: small, one subject each, imperative.
 - No new setting, mode, command, alias, fallback, or default that depends on another setting without the maintainer's explicit OK. `tests/test_config.py` freezes the list of `DEFAULTS` keys and `tests/test_commands.py` the `/cacheguard` sub-commands: a change there must be asked for.
 - Do not push, publish or spend provider money without an explicit request.
 - Open work is tracked by the maintainer outside the repo. If unsure what is wanted, ask.

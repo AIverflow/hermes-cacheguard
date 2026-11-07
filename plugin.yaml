@@ -1,5 +1,5 @@
 name: cacheguard
-version: "0.5.0"
+version: "0.6.0"
 tested_hermes: "0.22.7"
 description: "Warns or blocks a large chat after a pause, when the prompt cache may have expired, and shows how often the cache was lost."
 author: "AIverflow"
@@ -35,6 +35,9 @@ config_schema:
   chat_files:
     type: number
     description: "Most chats that keep a tracking file, newest first. Whole number, 1 or more; default 200"
+  models:
+    type: list
+    description: "Own settings for single models: lines like {model: provider/model, pause_m: 5, size_k: 30, mode: warn}. Set it with /cacheguard set model; default none"
 provides_middleware:
   - llm_request
   - llm_execution

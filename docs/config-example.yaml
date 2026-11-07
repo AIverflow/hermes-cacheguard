@@ -21,3 +21,4 @@ plugins:
         display_on_success: false  # show the result line when the cache was kept (loss and unknown always show)
         block_images: false        # also block a message with an image (then attach it again to send)
         tiny_block: false          # one short BLOCKED line instead of three
+        models: []                 # own pause_m, size_k or mode for single models, e.g. [{model: provider/model, mode: warn}]

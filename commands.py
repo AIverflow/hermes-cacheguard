@@ -20,16 +20,19 @@ _SET_USAGE = (
     "  chat_files    whole number >= 1  most chats that keep a tracking file (default 200)\n"
     "  display_on_success  on | off    show the result line when the cache was kept (default off)\n"
     "  block_images  on | off          also block a message with an image; attach it again to send (default off)\n"
-    "  tiny_block    on | off          one short BLOCKED line instead of three (default off)"
+    "  tiny_block    on | off          one short BLOCKED line instead of three (default off)\n"
+    "  model <pause_m|size_k|mode> <value>   own value for the model of this chat\n"
+    "  model reset                           this chat's model back to the global settings"
 )
 
 
 _SETUP_USAGE = (
-    "usage: /cacheguard setup <all|cli|desktop|gateway> <off|warn|block> [pause_m] [size_k]\n"
+    "usage: /cacheguard setup <all|cli|desktop|gateway|model> <off|warn|block> [pause_m] [size_k]\n"
     "  /cacheguard setup all off                   cli, desktop and gateway: off (pause and size unchanged)\n"
     "  /cacheguard setup all block 10 30           cli, desktop and gateway: block\n"
     "  /cacheguard setup gateway warn 10 30        gateway: warn (even if it was off)\n"
-    "  Give both pause and size, or neither. Pause and size apply to all groups."
+    "  /cacheguard setup model block 10 50         the model of this chat only\n"
+    "  Give both pause and size, or neither. Pause and size apply to all groups (with model: to that model only)."
 )
 
 _HELP_TEXT = (
@@ -39,9 +42,10 @@ _HELP_TEXT = (
     "  /cacheguard                          settings, and the table: how often the cache was lost\n"
     "  /cacheguard all                      every recorded model\n"
     "  /cacheguard <model>                  only models whose name contains this text\n"
-    "  /cacheguard setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k]\n"
-    "                                       one group, or all three. Pause and size apply to all groups:\n"
-    "                                       give them together, or leave them out to keep the current values\n"
+    "  /cacheguard setup <all|cli|desktop|gateway|model> <mode> [pause_m] [size_k]\n"
+    "                                       one group, all three, or the model of this chat. Pause and size:\n"
+    "                                       give both or neither. For a group they apply to all groups;\n"
+    "                                       for model, to that model only\n"
     "  /cacheguard set <name> <value>\n"
     + "\n".join(_SET_USAGE.splitlines()[1:]) + "\n"
     "  /cacheguard reset                    delete saved history\n"
@@ -51,8 +55,10 @@ _HELP_TEXT = (
     "  /cacheguard setup all off            cli, desktop and gateway: off (pause and size unchanged)\n"
     "  /cacheguard setup cli block 10 20    cli: block after a 10 minute pause, prompts of 20k+\n"
     "  /cacheguard setup gateway warn 10 30 gateway warns, even if it was off\n"
+    "  /cacheguard setup model block 10 50  the model of this chat: block after a 10 minute pause, prompts of 50k+; it wins over the groups that are not off\n"
     "  /cacheguard set gateway block        guard Telegram and other messaging platforms\n"
-    "  /cacheguard set pause_m 1            change only the pause, here 1 minute"
+    "  /cacheguard set pause_m 1            change only the pause, here 1 minute\n"
+    "  /cacheguard set model mode warn      the model of this chat: never blocked, only warned"
 )
 
 
@@ -97,7 +103,51 @@ def _save_setting(key: str, value: Any) -> None:
     config._CTX.set_config(key, value)
 
 
-def _cmd_set(args: list[str]) -> str:
+_NO_MODEL = "cacheguard: no model seen in this chat yet; send a message first."
+
+
+def _chat_model(session_id: str) -> str | None:
+    """The `provider/model` of this chat, None while the chat has none."""
+    stored = storage._get_session(session_id).get("model") if session_id else None
+    return stored if isinstance(stored, str) and "/" in stored else None
+
+
+def _cmd_set_model(args: list[str], session_id: str) -> str:
+    """/cacheguard set model <pause_m|size_k|mode> <value> | reset: the model line of this chat's model."""
+    reset = [a.lower() for a in args] == ["reset"]
+    if not reset and (len(args) != 2 or args[0].lower() not in ("pause_m", "size_k", "mode")):
+        return _SET_USAGE
+    if not reset:
+        name = args[0].lower()
+        if name == "mode":
+            if args[1].lower() not in config._MODES:
+                return "cacheguard: mode must be one of off, warn, block.\n" + _SET_USAGE
+            value, shown = args[1].lower(), args[1].lower()
+        else:
+            parsed, err = _parse_setting(name, args[1])
+            if parsed is None:
+                return err + "\n" + _SET_USAGE
+            _, value, shown = parsed
+    stored = _chat_model(session_id)
+    if stored is None:
+        return _NO_MODEL
+    current = config._cfg()["models"]
+    lines = [line for line in current if line["model"] != stored]
+    if not reset:
+        old = next((line for line in current if line["model"] == stored), {"model": stored})
+        lines.append({**old, name: value})
+    try:
+        _save_setting("models", lines)
+    except Exception as exc:
+        return f"cacheguard: could not write models ({exc})."
+    if reset:
+        return f"cacheguard: {stored} uses the global settings (saved to config)."
+    return f"cacheguard: {stored} {name} = {shown} (saved to config)."
+
+
+def _cmd_set(args: list[str], session_id: str = "") -> str:
+    if args and args[0].lower() == "model":
+        return _cmd_set_model(args[1:], session_id)
     if len(args) != 2:
         return _SET_USAGE
     parsed, err = _parse_setting(args[0], args[1])
@@ -111,21 +161,21 @@ def _cmd_set(args: list[str]) -> str:
     return f"cacheguard: {name} = {shown} (saved to config)."
 
 
-def _cmd_setup(args: list[str]) -> str:
-    """/cacheguard setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k]. Pause and size: both or neither.
+def _cmd_setup(args: list[str], session_id: str = "") -> str:
+    """/cacheguard setup <all|cli|desktop|gateway|model> <mode> [pause_m] [size_k]. Pause and size: both or neither.
 
     Nothing is written unless every given value is valid.
     """
     if len(args) < 2 or len(args) > 4:
         return _SETUP_USAGE
-    if args[0].lower() not in ("all",) + _SETUP_GROUPS:
-        return f"cacheguard: Unknown group {args[0]}; use all, cli, desktop or gateway.\n" + _SETUP_USAGE
+    if args[0].lower() not in ("all", "model") + _SETUP_GROUPS:
+        return f"cacheguard: Unknown group {args[0]}; use all, cli, desktop, gateway or model.\n" + _SETUP_USAGE
     if len(args) == 3:
         return "cacheguard: Give both pause and size, or omit both.\n" + _SETUP_USAGE
     target, mode_raw = args[0].lower(), args[1]
     if mode_raw.lower() not in ("off", "warn", "block"):
         return "cacheguard: mode must be off, warn or block.\n" + _SETUP_USAGE
-    groups = list(_SETUP_GROUPS) if target == "all" else [target]
+    groups = [] if target == "model" else list(_SETUP_GROUPS) if target == "all" else [target]
     items = [(g, _parse_setting(g, mode_raw)[0]) for g in groups]
     with_timing = len(args) == 4
     if with_timing:
@@ -136,6 +186,8 @@ def _cmd_setup(args: list[str]) -> str:
         if size_item is None:
             return err + "\n" + _SETUP_USAGE
         items += [("pause_m", pause_item), ("size_k", size_item)]
+    if target == "model":
+        return _setup_model(session_id, mode_raw.lower(), items)
     for name, (key, value, _shown) in items:
         try:
             _save_setting(key, value)
@@ -147,6 +199,23 @@ def _cmd_setup(args: list[str]) -> str:
     shown = {name: parsed[2] for name, parsed in items}
     return (f"cacheguard: {modes} · pause ≥ {shown['pause_m']} · size ≥ {shown['size_k']} "
             "(pause and size apply to all groups; saved to config).")
+
+
+def _setup_model(session_id: str, mode: str, items: list[tuple[str, Any]]) -> str:
+    """Write mode (and the pause and size items, if any) into the line of this chat's model."""
+    stored = _chat_model(session_id)
+    if stored is None:
+        return _NO_MODEL
+    current = config._cfg()["models"]
+    old = next((line for line in current if line["model"] == stored), {"model": stored})
+    new = {**old, "mode": mode, **{name: parsed[1] for name, parsed in items}}
+    try:
+        _save_setting("models", [line for line in current if line["model"] != stored] + [new])
+    except Exception as exc:
+        return f"cacheguard: could not write models ({exc})."
+    shown = [f"mode = {mode}"] + [
+        f"{'pause' if name == 'pause_m' else 'size'} ≥ {parsed[2]}" for name, parsed in items]
+    return f"cacheguard: {stored} · {' · '.join(shown)} (this model only; saved to config)."
 
 
 _SETUP_GROUPS = ("cli", "desktop", "gateway")
@@ -176,7 +245,7 @@ def _unknown_argument(word: str) -> str:
     return f"unknown argument '{word}'. Try /cacheguard help"
 
 
-def _cmd_show(raw_args: str = "", platform: str = "") -> str:
+def _cmd_show(raw_args: str = "", platform: str = "", session_id: str = "") -> str:
     """The /cacheguard command. platform: the surface Hermes calls it from (cli, telegram, ...)."""
     parts = (raw_args or "").split()
     if parts and parts[0].lower() == "help":
@@ -185,9 +254,9 @@ def _cmd_show(raw_args: str = "", platform: str = "") -> str:
         # A Markdown renderer folds the spaces and joins the lines; a fence keeps them.
         return f"```\n{_HELP_TEXT}\n```" if _markdown_surface(platform) else _HELP_TEXT
     if parts and parts[0].lower() == "set":
-        return _cmd_set(parts[1:])
+        return _cmd_set(parts[1:], session_id)
     if parts and parts[0].lower() == "setup":
-        return _cmd_setup(parts[1:])
+        return _cmd_setup(parts[1:], session_id)
     if parts and parts[0].lower() == "reset":
         return "usage: /cacheguard reset" if len(parts) > 1 else _cmd_reset()
     show_all = bool(parts) and parts[0].lower() == "all"  # every row, not the top ones
@@ -236,6 +305,7 @@ def _summary(parts: list[str], show_all: bool, platform: str) -> str:
         f"  ·  pause {confirm._pause_text(config._pause_seconds(cfg['pause_m']))}"
         f"  ·  size {cfg['size_k']:g}k  ·  {pauses}",
         "  ·  ".join(f"{name} {_shown_value(cfg[name])}" for name in _OTHER_SETTINGS),
+        *(_model_line(line) for line in cfg["models"]),
         "",
         f"setup: /cacheguard setup all block {minutes} {kilo}  (cli, desktop and gateway: block after a {minutes} minute pause, size over {kilo}k tokens)",
         "set: /cacheguard set pause_m 1  (change only the pause, here 1 minute)",
@@ -262,6 +332,12 @@ def _summary(parts: list[str], show_all: bool, platform: str) -> str:
 
 
 _OTHER_SETTINGS = ("tiny_block", "block_images", "display_on_success", "journal_rows", "chat_files")
+
+
+def _model_line(line: dict[str, Any]) -> str:
+    """One model line for the summary: only the fields it sets."""
+    shown = {"pause_m": "pause {:g} min", "size_k": "size {:g}k", "mode": "mode {}"}
+    return f"{line['model']}: " + ", ".join(text.format(line[key]) for key, text in shown.items() if key in line)
 
 
 def _shown_value(value: Any) -> str:
@@ -297,10 +373,11 @@ def _pause_table(shown: list[tuple[str, list[dict[str, int]]]], evaluated: list[
     return table
 
 
-def _cmd_entry(raw_args: str = "", *, platform: str | None = "") -> str:
+def _cmd_entry(raw_args: str = "", *, platform: str | None = "", session_id: str | None = "") -> str:
     """/cacheguard output with blank lines as one space: the Hermes TUI pager drops
     empty lines (NousResearch/hermes-agent#30782); the CLI shows both the same.
-    Hermes passes `platform` to handlers that name it."""
-    return "\n".join(line or " " for line in _cmd_show(raw_args, platform=str(platform or "").strip().lower()).split("\n"))
+    Hermes passes `platform` and `session_id` to handlers that name them."""
+    out = _cmd_show(raw_args, platform=str(platform or "").strip().lower(), session_id=str(session_id or ""))
+    return "\n".join(line or " " for line in out.split("\n"))
 
 _TOP_ROWS = 10
