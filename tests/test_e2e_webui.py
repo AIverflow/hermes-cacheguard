@@ -67,3 +67,48 @@ def test_webui_block_shows_blocked_then_resend_sends(webui, fake_provider):
     _until(lambda: texts("assistant")[-1:] == ["pong"], "reply after resend")
     sent = [r["messages"] for r in fake_provider.requests if "second" in str(r["messages"][-1]["content"])]
     assert len(sent) == 1 and not any("CACHEGUARD" in str(m["content"]) for m in sent[0])
+
+
+def _content_text(message):
+    content = message["content"]
+    return content if isinstance(content, str) else json.dumps(content)
+
+
+def test_webui_retry_after_block_sends_the_typed_text(webui, fake_provider):
+    """Like the web UI's frontend: /api/session/retry, then send the text it returns."""
+    sid = webui.call("/api/session/new", {})["session"]["session_id"]
+
+    def messages():
+        return webui.call("/api/session?session_id=" + sid)["session"].get("messages") or []
+
+    def texts(role):
+        return [str(m.get("content")) for m in messages() if m["role"] == role]
+
+    def main_calls():  # the web UI also asks the provider for a title and a summary: 2-message requests
+        return [r["messages"] for r in fake_provider.requests
+                if len(r["messages"]) >= 3
+                and next(_content_text(m) for m in r["messages"] if m["role"] == "user").endswith("hello")]
+
+    webui.call("/api/chat/start", {"session_id": sid, "message": "hello"})
+    _until(lambda: texts("assistant"), "first reply")
+    webui.home.age_sessions()
+    _until(lambda: _start(webui, sid, "second message"), "second turn accepted")
+    _until(lambda: any("BLOCKED" in t for t in texts("assistant")), "BLOCKED reply")
+
+    retry = webui.call("/api/session/retry", {"session_id": sid})["last_user_text"]
+    assert "withheld" in retry  # the web UI hands back Hermes's placeholder, not the typed text
+    _until(lambda: _start(webui, sid, retry), "retry accepted")
+    _until(lambda: main_calls() or any("BLOCKED" in t for t in texts("assistant")), "reply or second block")
+    assert not any("BLOCKED" in t for t in texts("assistant"))  # /retry removed the first one: no second block
+    _until(lambda: texts("assistant").count("pong") == 2, "reply after retry")
+    calls = main_calls()
+    assert len(calls) == 1, calls
+    retry_call = calls[0]
+    assert _content_text(retry_call[-1]).endswith("second message")
+    assert "withheld" not in json.dumps(retry_call) and "CACHEGUARD" not in json.dumps(retry_call)
+
+    _until(lambda: _start(webui, sid, "third message"), "third turn accepted")
+    _until(lambda: len(main_calls()) == 2, "third call")
+    third_call = main_calls()[1]
+    assert [json.dumps(m, sort_keys=True) for m in third_call[:len(retry_call)]] == \
+        [json.dumps(m, sort_keys=True) for m in retry_call]  # the retry call is an exact prefix

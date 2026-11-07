@@ -27,6 +27,7 @@ spec = importlib.util.spec_from_file_location("cache_guard_probe", plugin_path,
 plugin = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
+from agent.message_metadata import PRE_LLM_BLOCK_WITHHELD_PROMPT
 from agent.usage_pricing import normalize_usage
 from hermes_cli.plugins import PluginContext
 plugin.config._CTX = PluginContext  # no live context here: the class carries the same post_message
@@ -35,6 +36,7 @@ u = normalize_usage({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tok
 print(json.dumps({
     "health": {k: list(v) for k, v in plugin.health._health().items()},
     "usage": [u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens],
+    "withheld": plugin.config._WITHHELD == PRE_LLM_BLOCK_WITHHELD_PROMPT,
 }))
 '''
 
@@ -60,3 +62,4 @@ def test_installed_hermes_has_what_the_plugin_needs(tmp_path):
     bad = {k: v[1] for k, v in data["health"].items() if not v[0]}
     assert not bad, bad
     assert data["usage"] == [100, 40, 0]
+    assert data["withheld"] is True

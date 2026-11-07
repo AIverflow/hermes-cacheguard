@@ -1328,6 +1328,23 @@ def test_hook_block_images_blocks_a_message_with_an_image(env):
     assert out["message"].endswith(IMAGE_LINE) and "/retry" not in out["message"]
 
 
+def test_hook_block_images_blocks_an_image_passed_as_a_list_like_the_tui(env):
+    # The TUI passes user_message as the content list (text part + image parts), the CLI as a string.
+    _blockable(env)
+    env.config["block_images"] = True
+    content = [{"type": "text", "text": "x" * 240000},
+               {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    history = [{"role": "user", "content": content}]
+    out = env.plugin._on_pre_llm_call(
+        conversation_history=history, user_message=content, session_id="s1", task_id="s1", model="m1",
+        platform="tui", is_first_turn=False, sender_id=None, turn_id="t1", parent_session_id=None)
+    assert out["action"] == "block" and out["message"].endswith(IMAGE_LINE)
+    again = env.plugin._on_pre_llm_call(
+        conversation_history=history, user_message=list(content), session_id="s1", task_id="s1", model="m1",
+        platform="tui", is_first_turn=False, sender_id=None, turn_id="t2", parent_session_id=None)
+    assert again is None  # attached again with the same text: the resend goes out
+
+
 def test_hook_block_images_changes_nothing_for_plain_text(env):
     _blockable(env)
     env.config["block_images"] = True
@@ -1403,6 +1420,12 @@ def test_hook_internal_error_lets_it_go(env, monkeypatch):
     assert _hook(env) is None
 
 
+def test_hook_lets_it_go_when_the_middleware_is_off(env, monkeypatch):
+    _blockable(env)
+    monkeypatch.setitem(env.plugin._H["checks"], "middleware", (False, "llm_execution: missing"))
+    assert _hook(env) is None
+
+
 def test_hook_garbage_arguments_let_it_go(env):
     assert env.plugin._on_pre_llm_call() is None
     assert env.plugin._on_pre_llm_call(session_id=["bad"], user_message=3) is None
@@ -1427,3 +1450,93 @@ def test_clean_history_drops_a_withheld_message_and_our_reply(env):
     out = env.plugin._on_llm_request(request=request, session_id="s1", platform="cli")
     assert out["request"]["messages"] == [items[0], items[1], items[4]]
     assert "withheld" not in json.dumps(out["request"])
+
+
+def test_clean_history_drops_the_web_ui_typed_row_too(env):
+    """The web UI saves the typed text, then the placeholder, then the BLOCKED reply: both rows go."""
+    reply = env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,000 tokens may be rebilled" + RETRY_LINE
+    items = [
+        {"role": "user", "content": "hello"}, {"role": "assistant", "content": "pong"},
+        {"role": "user", "content": "boooo23"}, {"role": "user", "content": HELD},
+        {"role": "assistant", "content": reply}, {"role": "user", "content": "question two"},
+    ]
+    assert env.plugin._clean_history(items) == [items[0], items[1], items[5]]
+
+
+def test_withheld_line_matches_hermes_text(env):
+    assert HELD == env.plugin._WITHHELD
+
+
+def test_hook_web_ui_retry_sends_the_withheld_line_and_passes(env):
+    _blockable(env)
+    assert _hook(env)["action"] == "block"
+    history = [{"role": "user", "content": "x" * 240000}, {"role": "user", "content": "[Workspace::v1: /w]\n" + HELD}]
+    assert _hook(env, HELD, history=history) is None  # the resend: not evaluated again
+    assert _hook(env, HELD, history=history)["action"] == "block"  # and the pass is used up
+
+
+def test_hook_withheld_line_with_nothing_held_is_checked_like_any_message(env):
+    _blockable(env)
+    history = [{"role": "user", "content": "x" * 240000}, {"role": "user", "content": HELD}]
+    assert _hook(env, HELD, history=history)["action"] == "block"
+
+
+@pytest.mark.parametrize("content, want", [
+    ("second\n\n[Workspace::v1: /w]\n" + HELD, "second"),
+    ("second\n\n" + HELD, "second"),
+    ("a\n\nb\n\n" + HELD, "a\n\nb"),
+])
+def test_clean_history_cuts_the_withheld_line_out_of_a_merged_row(env, content, want):
+    row = {"role": "user", "content": content, "extra": 1}
+    out = env.plugin._clean_history([row])
+    assert out == [{"role": "user", "content": want, "extra": 1}]
+    assert row["content"] == content  # the input is not changed
+
+
+def test_clean_history_cuts_the_withheld_line_out_of_text_parts(env):
+    row = {"role": "user", "content": [{"type": "text", "text": "second\n\n" + HELD,
+                                        "cache_control": {"type": "ephemeral"}}]}
+    out = env.plugin._clean_history([row])
+    assert out == [{"role": "user", "content": [{"type": "text", "text": "second",
+                                                 "cache_control": {"type": "ephemeral"}}]}]
+    assert row["content"][0]["text"] == "second\n\n" + HELD
+    row = {"role": "user", "content": [{"type": "input_text", "text": "second\n\n" + HELD}]}
+    assert env.plugin._clean_history([row])[0]["content"] == [{"type": "input_text", "text": "second"}]
+
+
+def test_clean_history_drops_a_part_that_was_only_the_withheld_line(env):
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    row = {"role": "user", "content": [{"type": "text", "text": "look"}, image, {"type": "text", "text": HELD}]}
+    assert env.plugin._clean_history([row])[0]["content"] == [{"type": "text", "text": "look"}, image]
+
+
+def test_clean_history_keeps_a_row_that_is_only_the_withheld_line(env):
+    rows = [{"role": "user", "content": HELD}, {"role": "user", "content": "[Workspace::v1: /w]\n" + HELD},
+            {"role": "user", "content": [{"type": "text", "text": HELD}]}]
+    out = env.plugin._clean_history(rows)
+    assert all(a is b for a, b in zip(out, rows, strict=True))
+
+
+def test_clean_history_leaves_other_rows_alone(env):
+    rows = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "pong " + HELD},
+            {"role": "assistant", "content": "x\n\n" + HELD},
+            {"role": "tool", "tool_call_id": "c1", "content": "x\n\n" + HELD},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    out = env.plugin._clean_history(rows)
+    assert all(a is b for a, b in zip(out, rows, strict=True))
+
+
+def test_clean_history_drops_a_merged_row_above_a_blocked_reply(env):
+    reply = env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,000 tokens may be rebilled" + RETRY_LINE
+    items = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "pong"},
+             {"role": "user", "content": "x\n\n" + HELD}, {"role": "assistant", "content": reply},
+             {"role": "user", "content": "next"}]
+    assert env.plugin._clean_history(items) == [items[0], items[1], items[4]]
+
+
+def test_llm_request_returns_the_request_without_the_withheld_line(env):
+    items = [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "pong"},
+             {"role": "user", "content": "second\n\n" + HELD}]
+    out = env.plugin._on_llm_request(request={"messages": items}, session_id="s1", platform="cli")
+    assert out["request"]["messages"] == [items[0], items[1], {"role": "user", "content": "second"}]
+    assert env.plugin._on_llm_request(request={"messages": items[:2]}, session_id="s1", platform="cli") is None

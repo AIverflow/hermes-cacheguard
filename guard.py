@@ -246,15 +246,57 @@ def _is_plain_user(msg: Any) -> bool:
     return True
 
 
+_WITHHELD_PART_TYPES = ("text", "input_text")
+
+
+def _drop_withheld(text: str) -> str:
+    """The text without the paragraphs that end with Hermes's withheld line (a workspace tag may sit above it)."""
+    if config._WITHHELD not in text:
+        return text
+    return "\n\n".join(p for p in text.split("\n\n") if p.split("\n")[-1] != config._WITHHELD)
+
+
+def _without_withheld(item: Any) -> Any:
+    """A typed user row without the withheld line Hermes merged into it; the same object when there is none.
+
+    The web UI's /retry sends that line in place of the blocked text. A row that is only that line
+    stays as it is (dropping it could break the order of roles); the BLOCKED reply after it removes it.
+    """
+    if not _is_plain_user(item):
+        return item
+    content = item.get("content")
+    if isinstance(content, str):
+        new = _drop_withheld(content)
+        return item if new == content or not new else {**item, "content": new}
+    if not isinstance(content, list):
+        return item
+    parts: list[Any] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") in _WITHHELD_PART_TYPES and isinstance(part.get("text"), str):
+            new = _drop_withheld(part["text"])
+            if new != part["text"]:
+                if not new:
+                    continue  # nothing left in this part
+                part = {**part, "text": new}
+        parts.append(part)
+    if len(parts) == len(content) and all(a is b for a, b in zip(parts, content, strict=True)):
+        return item
+    if not any(isinstance(p, dict) and p.get("type") in _WITHHELD_PART_TYPES and p.get("text") for p in parts):
+        return item  # only the withheld line was there
+    return {**item, "content": parts}
+
+
 def _clean_history(items: list[Any]) -> list[Any]:
-    """The history without our BLOCKED replies: each one is dropped with the question it answered."""
+    """The history without our BLOCKED replies: each one is dropped with the question it answered
+    (the web UI saves two rows for it: the typed text, then Hermes's withheld placeholder).
+    Withheld lines merged into a row that stays (after a web UI /retry) are cut out of it."""
     out: list[Any] = []
     for item in items:
         if _is_blocked_reply(item):
-            if out and _is_plain_user(out[-1]):
+            while out and _is_plain_user(out[-1]):
                 out.pop()  # the question was never sent to the model
             continue
-        out.append(item)
+        out.append(_without_withheld(item))
     return out
 
 
@@ -316,7 +358,8 @@ def _take_prefix(sid: str, api_request_id: str) -> tuple[int, str, bool] | None:
 
 
 def _on_llm_request(**kwargs: Any) -> Any:
-    """Keep cacheguard's own lines in the chat but out of what the model receives. Never raises."""
+    """Keep cacheguard's own lines (and the withheld lines of blocked messages) in the chat but out of what
+    the model receives. Never raises."""
     try:
         if config._is_unattended(kwargs):
             return None
@@ -428,12 +471,16 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
     that one resend is let through without a new check.
     """
     try:
-        if config._is_unattended(kwargs) or _is_auxiliary(kwargs):
+        # Without the middleware the chat's time never moves on: every message would be blocked.
+        if config._is_unattended(kwargs) or _is_auxiliary(kwargs) or not health._healthy("middleware"):
             return None
         sid = kwargs.get("session_id")
         text = kwargs.get("user_message")
+        if isinstance(text, list):  # the TUI passes a message with an image as its content parts
+            text = "\n\n".join(p["text"] for p in text if _is_text_part(p))
         held = _HELD.pop(sid, None) if isinstance(sid, str) else None
-        if held is not None and isinstance(text, str) and held == _text_hash(text):
+        # The web UI's /retry sends Hermes's withheld line in place of the blocked text (kept in the row above).
+        if held is not None and isinstance(text, str) and (held == _text_hash(text) or text == config._WITHHELD):
             return None  # the resend of the message just blocked
         cfg = config._cfg()
         if config._surface_mode(kwargs, cfg) != "block" or confirm._single_query():

@@ -101,7 +101,7 @@ Example: with `pause_m 10` and `size_k 20`, you come back after 12 minutes to a 
     Or start /new and paste it. Session ID: <id>
 
 - `lost 4 of 10 similar pauses`: 4 of your past calls after a pause of about the same length (the same column of the `/cacheguard` table) lost the cache. It shows once there are 10 such calls.
-- **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait. In Telegram and other chats, `/retry` is a tappable command.
+- **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
 - Once a message is sent, the pause clock restarts: no new block until the next pause.
 - **Start over:** `/new`, then paste the message. The session ID lets the new chat read the old one back.
 - After a model change the text reads `BLOCKED · model changed a → b · ~48,000 tokens may be rebilled`.

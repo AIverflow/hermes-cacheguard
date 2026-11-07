@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
 
 _PREFIX = "[CACHEGUARD]"  # the ONE prefix of every line cacheguard adds to a chat
 _BLOCKED_PREFIX = _PREFIX + " BLOCKED · "  # starts every "message not sent" reply; history cleaning finds them by it
+_WITHHELD = "[Message withheld: a pre_llm_call policy hook blocked it.]"  # Hermes's stored text for a message a pre_llm_call hook blocked (agent.message_metadata.PRE_LLM_BLOCK_WITHHELD_PROMPT)
 _POST_PREFIX = "CGUARD"  # prefix of the short posted notices (the TUI status bar cuts them at ~45 characters)
 
 
