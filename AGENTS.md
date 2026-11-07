@@ -20,9 +20,9 @@ Hermes plugin that warns or blocks before a large chat message is sent after a p
 - **Block = the `pre_llm_call` hook returns `{"action": "block", "message": ...}`**: the message is not sent and the reply starts with `[CACHEGUARD] BLOCKED · `. The user sends it with `/retry` or by sending the same text again; that one resend passes without a new check.
 - **The model never sees cacheguard's lines**: `llm_request` removes each BLOCKED reply and the message it answered.
 - **A message with an image is only warned** unless `block_images` is on (`/retry` refuses media).
-- **No screen to read a reply** (`chat -q`) → `block` becomes `warn`. `-Q`, `--oneshot` and `-z` runs are auxiliary and pass through.
+- **No screen to read a reply** (`chat -q`) → `block` becomes `warn`. `-Q`, `--oneshot` and `-z` runs are never blocked and show no line (a `-Q` run may still be counted in the stats).
 - **Never call the provider twice**: the provider call stays outside plugin exception handling.
-- Unattended callers (cron, kanban, api_server, auxiliary calls such as one-shot `-Q` runs, Bot Chat included) pass through untouched.
+- Unattended callers (cron, kanban, api_server, auxiliary calls) pass through untouched. One-shot runs (`-Q`, Bot Chat `-Q` included): see the rule above.
 - Modes are per group: `cli`, `desktop`, `gateway`. Pause and size thresholds are global.
 - Hermes internals are private and change: `_health()` checks the symbols this plugin relies on. Do not patch or wrap Hermes functions.
 - Texts shown to users: short, plain words, no jargon.

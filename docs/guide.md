@@ -15,7 +15,8 @@ Anthropic (Claude):
 
 OpenRouter:
 
-- After 10 minutes without a message, it may switch provider, and the new one has no cache (OpenRouter docs). Pin one provider per model in the Hermes config:
+- By default, OpenRouter may switch provider after 10 minutes without a message (OpenRouter docs), and the new one has no cache.
+- Pin one provider per model in the Hermes config:
 
 ```yaml
 provider_routing:
@@ -25,9 +26,11 @@ provider_routing:
         - deepinfra
 ```
 
-DeepSeek:
+- Measured: on OpenRouter, a DeepSeek model through DeepInfra keeps its cache about 2 hours.
 
-- No fixed cache time (DeepSeek docs). Tested once: kept after 2 hours, lost after 2.5 hours.
+DeepSeek as provider:
+
+- Measured: its cache lasts 3 days to a week, so this plugin makes less sense.
 
 Once a large chat has gone cold, it often costs less to start over: type `/new`, then ask the new chat to read back the old session by its ID (for example the first and last messages). Hermes can read a session by its ID with its `session_search` tool.
 
@@ -124,9 +127,9 @@ The basics are in the [README](../README.md#using-it). A few more things:
 - To send a blocked message: `/retry`, or send the same text again. That one resend goes out with no new check and no time limit. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
 - After a message is sent, the pause clock restarts: no new block until the next pause.
 - A message with an image is only warned, because Hermes' `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again.
-- If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees only text and treats the message as text. Not tested live.
+- If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees only text and treats the message as text.
 - `hermes chat -q` has no screen to read the reply, so `block` acts as `warn`.
-- `-Q`, `--oneshot` and `hermes -z` runs are left alone like background calls: no block, no line, no measurement.
+- `-Q`, `--oneshot` and `hermes -z` runs are left alone like background calls: no block, no line. A `-Q` run may still be counted in the stats.
 - The model is compared by name only (the hook gets no provider). The provider comes from the model stored for the chat.
 - When cacheguard cannot tell whether the cache held (first call of a chat, a model that does not report its cache, a call that read nothing from the cache before the model showed 2 cache hits…), the line says `cache unknown` and why, for example `cache unknown, needs 1 more cache hit`.
 - After a model change, a loss counts up to N tokens rebilled: the count includes your new message.

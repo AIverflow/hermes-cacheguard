@@ -18,8 +18,7 @@ def test_cli_one_shot_quiet_sends_and_shows_no_cacheguard_lines(hermes_python, m
     second = home.cli(hermes_python, "chat", "-q", "again", "-Q", "--resume", sid)
     out = second.stdout + second.stderr
     assert second.returncode == 0, out
-    # -Q runs get a minted task id, so cacheguard treats them as background calls and leaves
-    # them alone: the message is sent, silently, and no row is written.
-    assert "CACHEGUARD" not in out
-    assert len(fake_provider.requests) >= 2  # plus a title call
-    assert home.observations() == []
+    # A -Q run is never blocked and shows no line: the message is sent, silently. Since Hermes 0.22.7
+    # its task id is the session id, so the call may still be counted in the stats.
+    assert "CACHEGUARD" not in out and "CGUARD" not in out
+    assert any("again" in str(r.get("messages")) for r in fake_provider.requests)

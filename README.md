@@ -2,7 +2,7 @@
 
 A Hermes plugin that stops you wasting money on an expired cache.
 
-Providers bill a cache hit at a fraction of the input price: about 1/10 at Anthropic and OpenAI, 1/50 or less at DeepSeek and Xiaomi.
+Providers bill a cache hit at a fraction of the input price: about 1/10 at Anthropic and OpenAI, 1/50 or less at Xiaomi.
 After a pause, the provider may have dropped your cache. Your next message in a large chat is then billed at the full input price, or more (Anthropic charges extra to write a new cache).
 
 cacheguard can stop it before it is sent (`block`) or tell you afterwards what was reused or rebilled (`warn`).
@@ -11,6 +11,8 @@ When a large chat's cache has expired, it is often cheaper to type `/new`, then 
 
 How long a cache lives depends on the provider, the model and your Hermes config: from 5 minutes to several hours.
 See [Get more from your cache](docs/guide.md#get-more-from-your-cache).
+
+If you use the DeepSeek provider, its cache lasts 3 days to a week (measured), so this plugin makes less sense.
 
 ## Scope
 
@@ -100,14 +102,14 @@ Example: with `pause_m 10` and `size_k 20`, you come back after 12 minutes to a 
     To send it anyway: /retry, or send it again.
     Or start /new and paste it. Session ID: <id>
 
+- `13:05`: when the block happened, on the clock of the machine running Hermes. The text stays in the chat, so you can tell an old block from a new one.
 - `lost 4 of 10 similar pauses`: 4 of your past calls after a pause of about the same length (the same column of the `/cacheguard` table) lost the cache. It shows once there are 10 such calls.
 - **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
-- `13:05`: when the block happened, on the clock of the machine running Hermes. The text stays in the chat, so you can tell an old block from a new one.
 - Once a message is sent, the pause clock restarts: no new block until the next pause.
 - **Start over:** `/new`, then paste the message. The session ID lets the new chat read the old one back.
 - After a model change the text reads `BLOCKED · 13:05 · model changed a → b · ~48,000 tokens may be rebilled`.
 - **Short form:** `/cacheguard set tiny_block on` gives one line, `[CACHEGUARD] BLOCKED · 13:05 · 12m 🕐 · ~48kt · 4/10`. Start with the default text. Once you know the plugin, switch tiny on.
-- **Images:** a message with an image is only warned, because `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again. If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees plain text and treats it as text. Not tested live.
+- **Images:** a message with an image is only warned, because `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again. If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees plain text and treats it as text.
 
 After you send, the result line says what happened:
 
