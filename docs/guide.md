@@ -114,12 +114,13 @@ The basics are in the [README](../README.md#using-it). A few more things:
 - Block means the message is not sent, and the reply starts with `[CACHEGUARD] BLOCKED · `. Needs Hermes 0.22.6 or newer.
 - By default the text has 3 lines:
 
-      [CACHEGUARD] BLOCKED · 12 minutes pause 🕐 · ~45,000 tokens may be rebilled · lost 3 of 4 similar pauses
+      [CACHEGUARD] BLOCKED · 13:05 · 12 minutes pause 🕐 · ~45,000 tokens may be rebilled · lost 3 of 4 similar pauses
       To send it anyway: /retry, or send it again.
       Or start /new and paste it. Session ID: …
 
-- After a model change the first line is `[CACHEGUARD] BLOCKED · model changed a → b · ~45,000 tokens may be rebilled`.
-- With `tiny_block on` it is one line: `[CACHEGUARD] BLOCKED · 12m 🕐 · ~45kt · 3/4` (`3/4`: lost 3 of 4 similar pauses). Start with the default; once you know the plugin, switch tiny on.
+- `13:05` is the time of the block, on the clock of the machine running Hermes (a Telegram user in another time zone sees that machine's time).
+- After a model change the first line is `[CACHEGUARD] BLOCKED · 13:05 · model changed a → b · ~45,000 tokens may be rebilled`.
+- With `tiny_block on` it is one line: `[CACHEGUARD] BLOCKED · 13:05 · 12m 🕐 · ~45kt · 3/4` (`3/4`: lost 3 of 4 similar pauses). Start with the default; once you know the plugin, switch tiny on.
 - To send a blocked message: `/retry`, or send the same text again. That one resend goes out with no new check and no time limit. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
 - After a message is sent, the pause clock restarts: no new block until the next pause.
 - A message with an image is only warned, because Hermes' `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again.
@@ -135,7 +136,7 @@ The basics are in the [README](../README.md#using-it). A few more things:
 
 The model never sees cacheguard's lines.
 
-- **Result lines and notices** are posted as short chat notices, outside the conversation. They start with `CGUARD`, for example `CGUARD 23k reused, 1 min` or `CGUARD WARN cache lost, 23k rebilled, 10 min`: the TUI status line cuts text at about 45 characters. Where they show: classic CLI, a dim line at the top of the reply; TUI, the status line at the bottom; Desktop and Web UI, a notification; Telegram, a separate bot message.
+- **Result lines and notices** are posted as short chat notices, outside the conversation. They start with `CGUARD` and the time, for example `CGUARD 13:05 23k reused, 1 min` or `CGUARD 13:05 WARN cache lost, 23k rebilled, 10 min`: the TUI status line cuts text at about 45 characters. Where they show: classic CLI, a dim line at the top of the reply; TUI, the status line at the bottom; Desktop and Web UI, a notification; Telegram, a separate bot message.
 - **BLOCKED replies** are real replies: Hermes saves them in the chat as if the model wrote them. Before each call, cacheguard removes every one of them from what is sent, with the message it answered, and the line `[Message withheld: …]` that Hermes saves in place of a blocked message. You still see them in the chat.
 - Only replies that start with `[CACHEGUARD] BLOCKED` are removed, always the same way, so the cache holds.
 - Installing, updating, or turning cacheguard off or on can change what is sent only in a chat that holds a BLOCKED reply or a `[Message withheld: …]` line: its next call may lose the cache once. Other chats keep it.

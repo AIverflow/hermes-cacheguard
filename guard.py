@@ -141,7 +141,7 @@ def _queue_note(session_id: Any, text: str, turn_id: Any = None) -> None:
 
 def _queue_outcome(kwargs: dict[str, Any], row: dict[str, Any],
                    display_on_success: bool = False) -> None:
-    """Keep the result line for transform_llm_output; after a warning it starts with `OK` (cache reused) or `WARN`.
+    """Keep the result line for transform_llm_output: `CGUARD 13:05 ...`; after a warning the time is followed by `OK` (cache reused) or `WARN`.
 
     With display_on_success off, a kept cache (not lost) queues nothing.
     """
@@ -158,7 +158,7 @@ def _queue_outcome(kwargs: dict[str, Any], row: dict[str, Any],
         return  # cache kept and nothing else to say; state above is already popped
     tag = "" if warned is None else ("OK " if reused else "WARN ")
     body = _outcome_text(row, change)
-    _queue_note(sid, f"{config._POST_PREFIX} {tag}{body}", kwargs.get("turn_id"))
+    _queue_note(sid, f"{config._POST_PREFIX} {confirm._clock()} {tag}{body}", kwargs.get("turn_id"))
 
 
 def _post(text: str) -> bool:

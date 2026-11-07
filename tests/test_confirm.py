@@ -1,4 +1,6 @@
 """Tests of confirm.py: pause text, block text, single-query marker."""
+import re
+
 import pytest
 from conftest import _cold_history
 
@@ -23,10 +25,15 @@ def test_single_query_env_fallback(env, monkeypatch, value, expected):
 
 # --- block text ---------------------------------------------------------------- #
 
-PAUSE = "[CACHEGUARD] BLOCKED · 1 minute pause 🕐 · ~31,521 tokens may be rebilled"
+PAUSE = "[CACHEGUARD] BLOCKED · 13:05 · 1 minute pause 🕐 · ~31,521 tokens may be rebilled"
 RETRY = "To send it anyway: /retry, or send it again."
 NEW = "Or start /new and paste it."
 ATTACH = "To send it anyway: attach the image again and send it again."
+
+
+@pytest.fixture(autouse=True)
+def _fixed_clock(env, monkeypatch):
+    monkeypatch.setattr(env.plugin, "_clock", lambda: "13:05")
 
 
 def _text(env, **kw):
@@ -34,6 +41,11 @@ def _text(env, **kw):
     args.update(kw)
     return env.plugin._block_text(args["size"], args["model"], args["prev"], args["gap_s"],
                                   args["session_id"], args.get("image", False), args.get("tiny", False))
+
+
+def test_clock_is_hours_and_minutes(env, monkeypatch):
+    monkeypatch.undo()  # the real clock, not the fixed one
+    assert re.fullmatch(r"\d\d:\d\d", env.plugin._clock())
 
 
 def test_block_text_pause_is_three_lines(env):
@@ -47,7 +59,7 @@ def test_block_text_pause_has_the_loss_counts_when_known(env):
 
 def test_block_text_model_change(env):
     lines = _text(env, prev="p/old", model="p/new", gap_s=None).split("\n")
-    assert lines[0] == "[CACHEGUARD] BLOCKED · model changed p/old → p/new · ~31,521 tokens may be rebilled"
+    assert lines[0] == "[CACHEGUARD] BLOCKED · 13:05 · model changed p/old → p/new · ~31,521 tokens may be rebilled"
     assert lines[1:] == [RETRY, NEW + " Session ID: local-6f04"]
 
 
@@ -73,12 +85,17 @@ def test_block_text_session_id_stays_on_one_line(env):
     ({"prev": "p/old", "model": "p/new", "gap_s": None, "image": True}, "p/old → p/new · ~32kt · attach the image again"),
 ])
 def test_tiny_block_text_is_one_line(env, kw, text):
-    assert _text(env, tiny=True, **kw) == "[CACHEGUARD] BLOCKED · " + text
+    assert _text(env, tiny=True, **kw) == "[CACHEGUARD] BLOCKED · 13:05 · " + text
 
 
 def test_tiny_block_text_has_the_loss_counts_when_known(env):
     _cold_history(env.plugin, cold=1, warm=62, gap=70)
-    assert _text(env, tiny=True) == "[CACHEGUARD] BLOCKED · 1m 🕐 · ~32kt · 1/63"
+    assert _text(env, tiny=True) == "[CACHEGUARD] BLOCKED · 13:05 · 1m 🕐 · ~32kt · 1/63"
+
+
+@pytest.mark.parametrize("tiny", [False, True])
+def test_both_block_texts_start_with_the_time(env, tiny):
+    assert _text(env, tiny=tiny).startswith(env.plugin._BLOCKED_PREFIX + "13:05 · ")
 
 
 @pytest.mark.parametrize("tiny", [False, True])

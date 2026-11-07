@@ -36,7 +36,7 @@ _HELP_TEXT = (
     "cacheguard help\n"
     "\n"
     "Commands\n"
-    "  /cacheguard                          summary: how often the cache was lost\n"
+    "  /cacheguard                          settings, and the table: how often the cache was lost\n"
     "  /cacheguard all                      every recorded model\n"
     "  /cacheguard <model>                  only models whose name contains this text\n"
     "  /cacheguard setup <all|cli|desktop|gateway> <mode> [pause_m] [size_k]\n"
@@ -180,7 +180,10 @@ def _cmd_show(raw_args: str = "", platform: str = "") -> str:
     """The /cacheguard command. platform: the surface Hermes calls it from (cli, telegram, ...)."""
     parts = (raw_args or "").split()
     if parts and parts[0].lower() == "help":
-        return _HELP_TEXT if len(parts) == 1 else _unknown_argument(parts[1])
+        if len(parts) > 1:
+            return _unknown_argument(parts[1])
+        # A Markdown renderer folds the spaces and joins the lines; a fence keeps them.
+        return f"```\n{_HELP_TEXT}\n```" if _markdown_surface(platform) else _HELP_TEXT
     if parts and parts[0].lower() == "set":
         return _cmd_set(parts[1:])
     if parts and parts[0].lower() == "setup":
@@ -232,6 +235,7 @@ def _summary(parts: list[str], show_all: bool, platform: str) -> str:
         f"cacheguard  ·  cli {cfg['cli']}  ·  desktop {cfg['desktop']}  ·  gateway {cfg['gateway']}"
         f"  ·  pause {confirm._pause_text(config._pause_seconds(cfg['pause_m']))}"
         f"  ·  size {cfg['size_k']:g}k  ·  {pauses}",
+        "  ·  ".join(f"{name} {_shown_value(cfg[name])}" for name in _OTHER_SETTINGS),
         "",
         f"setup: /cacheguard setup all block {minutes} {kilo}  (cli, desktop and gateway: block after a {minutes} minute pause, size over {kilo}k tokens)",
         "set: /cacheguard set pause_m 1  (change only the pause, here 1 minute)",
@@ -255,6 +259,13 @@ def _summary(parts: list[str], show_all: bool, platform: str) -> str:
     if len(shown) < len(selected):
         lines.append(f"... {len(selected) - len(shown)} more models: /cacheguard all")
     return "\n".join(lines)
+
+
+_OTHER_SETTINGS = ("tiny_block", "block_images", "display_on_success", "journal_rows", "chat_files")
+
+
+def _shown_value(value: Any) -> str:
+    return ("on" if value else "off") if isinstance(value, bool) else str(value)
 
 
 def _pause_table(shown: list[tuple[str, list[dict[str, int]]]], evaluated: list[dict[str, Any]],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from . import config, measure, storage
 
@@ -39,6 +40,11 @@ def _cold_counts(model: str, gap_s: float) -> tuple[int, int] | None:
     return None
 
 
+def _clock() -> str:
+    """The time shown in the BLOCKED text and the result line, on the clock of the machine running Hermes."""
+    return time.strftime("%H:%M")
+
+
 def _block_text(size: int, model: str, prev: str | None, gap_s: float | None,
                 session_id: str | None = None, image: bool = False, tiny: bool = False) -> str:
     """The reply shown when the pre_llm_call hook blocks a message (a model change or a pause).
@@ -52,7 +58,7 @@ def _block_text(size: int, model: str, prev: str | None, gap_s: float | None,
             head = f"{prev} → {model} · {tokens}"
         else:
             head = f"{measure._short_pause(gap_s)} 🕐 · {tokens}" + (f" · {cold[0]}/{cold[1]}" if cold is not None else "")
-        return config._BLOCKED_PREFIX + head + (" · attach the image again" if image else "")
+        return config._BLOCKED_PREFIX + f"{_clock()} · " + head + (" · attach the image again" if image else "")
     if prev is not None:
         head = f"model changed {prev} → {model} · ~{size:,} tokens may be rebilled"
     else:
@@ -62,4 +68,4 @@ def _block_text(size: int, model: str, prev: str | None, gap_s: float | None,
     last = "Or start /new and paste it."
     if session_id:
         last += " Session ID: " + json.dumps(str(session_id), ensure_ascii=False)[1:-1]
-    return config._BLOCKED_PREFIX + head + f"\nTo send it anyway: {how}.\n" + last
+    return config._BLOCKED_PREFIX + f"{_clock()} · " + head + f"\nTo send it anyway: {how}.\n" + last

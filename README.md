@@ -96,34 +96,35 @@ Two limits count items, not days. Defaults: `journal_rows 10000` (most calls kep
 
 Example: with `pause_m 10` and `size_k 20`, you come back after 12 minutes to a 48k-token chat. Your message is not sent. cacheguard replies:
 
-    [CACHEGUARD] BLOCKED · 12 minutes pause 🕐 · ~48,000 tokens may be rebilled · lost 4 of 10 similar pauses
+    [CACHEGUARD] BLOCKED · 13:05 · 12 minutes pause 🕐 · ~48,000 tokens may be rebilled · lost 4 of 10 similar pauses
     To send it anyway: /retry, or send it again.
     Or start /new and paste it. Session ID: <id>
 
 - `lost 4 of 10 similar pauses`: 4 of your past calls after a pause of about the same length (the same column of the `/cacheguard` table) lost the cache. It shows once there are 10 such calls.
 - **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
+- `13:05`: when the block happened, on the clock of the machine running Hermes. The text stays in the chat, so you can tell an old block from a new one.
 - Once a message is sent, the pause clock restarts: no new block until the next pause.
 - **Start over:** `/new`, then paste the message. The session ID lets the new chat read the old one back.
-- After a model change the text reads `BLOCKED · model changed a → b · ~48,000 tokens may be rebilled`.
-- **Short form:** `/cacheguard set tiny_block on` gives one line, `[CACHEGUARD] BLOCKED · 12m 🕐 · ~48kt · 4/10`. Start with the default text. Once you know the plugin, switch tiny on.
+- After a model change the text reads `BLOCKED · 13:05 · model changed a → b · ~48,000 tokens may be rebilled`.
+- **Short form:** `/cacheguard set tiny_block on` gives one line, `[CACHEGUARD] BLOCKED · 13:05 · 12m 🕐 · ~48kt · 4/10`. Start with the default text. Once you know the plugin, switch tiny on.
 - **Images:** a message with an image is only warned, because `/retry` refuses images and the up arrow drops them. With `block_images on` it is blocked too: attach the image again and send it again. If Hermes first turns images into a text description (`image_input_mode: text`, models without vision), cacheguard sees plain text and treats it as text. Not tested live.
 
 After you send, the result line says what happened:
 
 - The cache was lost:
 
-      CGUARD cache lost, 48k rebilled, 12 min
+      CGUARD 13:05 cache lost, 48k rebilled, 12 min
 
 - The cache was kept: no line by default. With `/cacheguard set display_on_success on`:
 
-      CGUARD 41k reused, 12 min
+      CGUARD 13:05 41k reused, 12 min
 
 ### `warn`: sends, then tells you
 
-The message goes out at once. The same line has `WARN` or `OK` after `CGUARD` (the `OK` line, too, only with `display_on_success` on):
+The message goes out at once. The same line has `WARN` or `OK` after the time (the `OK` line, too, only with `display_on_success` on):
 
-    CGUARD WARN cache lost, 48k rebilled, 12 min
-    CGUARD OK 41k reused, 12 min
+    CGUARD 13:05 WARN cache lost, 48k rebilled, 12 min
+    CGUARD 13:05 OK 41k reused, 12 min
 
 ![Result lines after a reply: cache lost, then cache reused](docs/images/result-lines.png)
 
@@ -135,7 +136,7 @@ Small chats and short pauses stay silent. The lines are not sent to the model ([
 
 | Command | What it does |
 |---|---|
-| `/cacheguard` | Table: how often the cache was lost, by pause length |
+| `/cacheguard` | Every setting, and a table: how often the cache was lost, by pause length |
 | `/cacheguard setup <group> <mode> [pause_m] [size_k]` | Set mode, pause and size (`pause_m` and `size_k`: both or neither) |
 | `/cacheguard set <name> <value>` | Change one setting |
 | `/cacheguard help` | Every command |

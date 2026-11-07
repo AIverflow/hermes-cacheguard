@@ -16,6 +16,11 @@ from conftest import (
 # ------------------------------------------------------------- formatting --
 
 
+@pytest.fixture(autouse=True)
+def _fixed_clock(env, monkeypatch):
+    monkeypatch.setattr(env.plugin, "_clock", lambda: "13:05")
+
+
 def test_warning_shows_nothing_before_the_reply(env):
     seed_session(env, ago=3600)
     run_middleware(env)
@@ -299,14 +304,14 @@ def test_loss_line_shown_when_option_off(env, monkeypatch):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode="warn", cached=1000)
     assert _reply(env) is None
-    assert env.posted == ["CGUARD WARN cache lost, 59k rebilled, 60 min"]
+    assert env.posted == ["CGUARD 13:05 WARN cache lost, 59k rebilled, 60 min"]
 
 
 def test_unknown_line_shown_when_option_off(env, monkeypatch):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode="warn", cached=0)
     assert _reply(env) is None
-    assert env.posted == ["CGUARD WARN cache unknown, needs 2 more cache hits, 60 min"]
+    assert env.posted == ["CGUARD 13:05 WARN cache unknown, needs 2 more cache hits, 60 min"]
 
 
 def test_model_changed_line_hidden_when_cache_kept_and_option_off(env, monkeypatch):
@@ -318,14 +323,14 @@ def test_model_changed_line_hidden_when_cache_kept_and_option_off(env, monkeypat
 def test_model_changed_line_shown_when_cache_kept_and_option_on(env, monkeypatch):
     env.config["display_on_success"] = True
     _turn(env, monkeypatch, mode="warn", model="m2")
-    assert _reply(env) is None and env.posted == ["CGUARD OK 59k reused, model changed"]
+    assert _reply(env) is None and env.posted == ["CGUARD 13:05 OK 59k reused, model changed"]
 
 
 def test_model_changed_line_shown_when_cache_lost_whatever_the_option(env, monkeypatch):
     env.config["display_on_success"] = False
     _turn(env, monkeypatch, mode="warn", model="m2", cached=0)
     assert _reply(env) is None
-    assert env.posted == ["CGUARD WARN cache lost, 60k rebilled, model changed"]
+    assert env.posted == ["CGUARD 13:05 WARN cache lost, 60k rebilled, model changed"]
 
 
 def test_outcome_stays_for_its_own_turn(env, monkeypatch):
@@ -360,13 +365,13 @@ def test_stale_gateway_warning_is_dropped_at_turn_start(env, monkeypatch):
 def test_outcome_loss_reports_rebilled_tokens_and_pause(env, monkeypatch):
     _guard_acts(env, monkeypatch, cached=1000)
     _reply(env)
-    assert env.posted == ["CGUARD WARN cache lost, 59k rebilled, 60 min"]
+    assert env.posted == ["CGUARD 13:05 WARN cache lost, 59k rebilled, 60 min"]
 
 
 def test_zero_read_with_one_positive_reports_no_baseline_yet(env, monkeypatch):
     _guard_acts(env, monkeypatch, cached=0)
     _reply(env)
-    assert env.posted == ["CGUARD WARN cache unknown, needs 2 more cache hits, 60 min"]
+    assert env.posted == ["CGUARD 13:05 WARN cache unknown, needs 2 more cache hits, 60 min"]
 
 
 def test_outcome_without_finite_pause_omits_clause(env):
@@ -560,7 +565,7 @@ def test_request_tool_result_before_blocked_is_kept(env):
     assert len(out) == 1 and out[0]["role"] == "user"
 
 
-RESULT_LINE = "CGUARD OK 59k reused, 60 min"
+RESULT_LINE = "CGUARD 13:05 OK 59k reused, 60 min"
 
 
 # --- notices: posted outside the model context -------------------------------- #
@@ -702,7 +707,7 @@ def test_warn_tag_is_short(env, monkeypatch):
            "prompt_tokens": 60000, "cache_read_tokens": 0}
     env.plugin._PENDING.clear()
     env.plugin._queue_outcome({"session_id": "s1"}, row)
-    assert env.plugin._PENDING["s1"] == "CGUARD WARN cache lost, 23k rebilled, 10 min"
+    assert env.plugin._PENDING["s1"] == "CGUARD 13:05 WARN cache lost, 23k rebilled, 10 min"
 
 
 def _msgs(n, mid="middle"):
@@ -1224,7 +1229,7 @@ def _blockable(env, mode="block", **kw):
 def test_hook_blocks_after_a_pause_in_block_mode(env):
     _blockable(env)
     out = _hook(env)
-    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "60 minutes pause 🕐 · ~60,008 tokens may be rebilled" + RETRY_LINE}
+    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "13:05 · 60 minutes pause 🕐 · ~60,008 tokens may be rebilled" + RETRY_LINE}
 
 
 def test_hook_block_text_has_the_loss_counts_when_known(env):
@@ -1244,7 +1249,7 @@ def test_hook_uses_the_one_line_text_when_tiny_block_is_on(env):
     _blockable(env)
     env.config["tiny_block"] = True
     out = _hook(env)
-    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "1h 🕐 · ~60kt"}
+    assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "13:05 · 1h 🕐 · ~60kt"}
     assert env.plugin._is_blocked_reply({"role": "assistant", "content": out["message"]})
 
 
@@ -1373,7 +1378,7 @@ def test_hook_text_parts_are_blocked_like_a_string(env):
 def test_hook_model_change_is_found_by_the_bare_name(env):
     _blockable(env, model="p/old")
     out = _hook(env, model="new")
-    assert out["message"] == (env.plugin._BLOCKED_PREFIX
+    assert out["message"] == (env.plugin._BLOCKED_PREFIX + "13:05 · "
                               + "model changed p/old → p/new · ~60,008 tokens may be rebilled" + RETRY_LINE)
 
 

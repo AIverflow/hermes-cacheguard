@@ -24,8 +24,10 @@ def test_cmd_empty_table(env):
     assert "2/5 = losses/calls" not in out
     assert out.splitlines()[0].startswith("cacheguard  ·  cli warn  ·  desktop warn  ·  gateway off  ·  pause ")
     assert "cli (terminal" not in out and "gateway (Telegram" not in out
-    assert out.splitlines()[2].startswith("setup: /cacheguard setup all block 10 20") and out.splitlines()[4] == "help: /cacheguard help"
-    assert out.splitlines()[3] == "set: /cacheguard set pause_m 1  (change only the pause, here 1 minute)"
+    assert out.splitlines()[1] == ("tiny_block off  ·  block_images off  ·  display_on_success off"
+                                   "  ·  journal_rows 10000  ·  chat_files 200")
+    assert out.splitlines()[3].startswith("setup: /cacheguard setup all block 10 20") and out.splitlines()[5] == "help: /cacheguard help"
+    assert out.splitlines()[4] == "set: /cacheguard set pause_m 1  (change only the pause, here 1 minute)"
     assert "settings: /cacheguard setup" not in out and "health:" not in out
 
 
@@ -64,6 +66,21 @@ def test_table_stays_plain_on_raw_surfaces(env, monkeypatch, platform, env_vars)
     _surface(monkeypatch, **env_vars)
     out = env.plugin._cmd_entry("", platform=platform)
     assert "```" not in out and len(_table_lines(out)) == 2
+
+
+def test_summary_shows_every_setting(env, monkeypatch):
+    monkeypatch.setattr(env.plugin, "_cfg", lambda: {**env.plugin.DEFAULTS, "tiny_block": True, "chat_files": 50})
+    line = env.plugin._cmd_show().splitlines()[1]
+    assert line.startswith("tiny_block on  ·  block_images off") and line.endswith("chat_files 50")
+    assert all(f"{name} " in line for name in env.plugin.DEFAULTS
+               if name not in ("cli", "desktop", "gateway", "pause_m", "size_k"))
+
+
+@pytest.mark.parametrize("surface", ["telegram", "webui"])
+def test_help_is_fenced_on_markdown_surfaces(env, monkeypatch, surface):
+    _surface(monkeypatch)
+    assert env.plugin._cmd_show("help", platform=surface) == f"```\n{env.plugin._HELP_TEXT}\n```"
+    assert env.plugin._cmd_show("help", platform="cli") == env.plugin._HELP_TEXT
 
 
 def test_webui_without_a_named_surface_is_a_markdown_surface(env, monkeypatch):

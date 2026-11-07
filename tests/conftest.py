@@ -1,6 +1,7 @@
 """Fakes for the Hermes modules the plugin imports lazily; no Hermes install needed."""
 import importlib.util
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -65,7 +66,7 @@ class Env:
         if sid in self.plugin._WARNED:
             return self.plugin._WARNED[sid]
         note = self.plugin._PENDING.get(sid)
-        return note if note and (note.startswith("CGUARD WARN ") or note.startswith("CGUARD OK ")) else None
+        return note if note and re.match(r"CGUARD \d\d:\d\d (WARN|OK) ", note) else None
 
     def db(self):
         con = sqlite3.connect(self.home / "state.db")
