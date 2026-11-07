@@ -265,7 +265,12 @@ def test_short_pause_text(env):
 
 def test_suggested_pause_all_kept_is_the_longest_pause_with_plus(env):
     pts = [(300.0 + 60 * i, False) for i in range(25)]
-    assert env.plugin._suggested_pause(pts) == "29m+"
+    assert env.plugin._suggested_pause(pts) == "25m+"  # the 5th longest pause: 5 calls reach it
+
+
+def test_suggested_pause_needs_five_calls_at_or_past_it(env):
+    pts = [(60.0 + i, False) for i in range(19)] + [(3 * 3600.0, False)]
+    assert env.plugin._suggested_pause(pts) == "1m+"  # one call at 3 h is not enough
 
 
 def test_suggested_pause_has_no_plus_when_a_later_block_exceeds(env):

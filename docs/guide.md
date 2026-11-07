@@ -125,7 +125,7 @@ A call lost the cache when at least 30% of the previous prompt was not read from
     openai-codex/gpt-6-sol  0/14   2/17     2/4        16m
 
 - `2/17`: 2 of 17 calls lost the cache. Every cell is `lost/calls`, no percent. The block text shows a count only from 10 calls in that pause length.
-- `suggested`: the longest pause where the cache was lost in 10% of calls or fewer, on a curve that never goes down as the pause grows (isotonic fit). `none` when even the shortest pauses lose more. Shown from 20 measurements of that model, otherwise `—`.
+- `suggested`: the longest pause where the cache was lost in 10% of calls or fewer, on a curve that never goes down as the pause grows (isotonic fit). `none` when even the shortest pauses lose more. Shown from 20 measurements of that model, otherwise `—`. At least 5 measurements must be at that pause or longer.
 - `+`: no loss seen beyond that pause; the cache may last longer.
 - Not counted: pauses under 1 minute, the first call of a chat, model switches, calls where the chat itself changed (`context changed`), background calls.
 - `context changed`: the start of the chat was not what the last call sent, for example Hermes edited an old message. cacheguard compares a fingerprint of the messages, kept in the chat's file (the messages themselves are not stored, and nothing is sent to the provider). Cache markers are ignored; the system prompt and tool list are not compared, unless they are in the message list. A call that shrank the prompt by more than 5% also counts as `context changed`.
@@ -160,7 +160,7 @@ The basics are in the [README](../README.md#using-it). More:
 
 **Sending a blocked message**
 
-- Use `/retry`, or send the same text again. That one resend goes out with no new check and no time limit.
+- Use `/retry`, or send the same text again. That one resend goes out with no new check, however long you wait, unless Hermes restarts in between.
 - In Telegram and other chats, `/retry` is a tappable command.
 - In the web UI, `/retry` shows `[Message withheld: …]` as your message. The model still gets the text you typed.
 - After a message is sent, the pause clock restarts: no new block until the next pause.
@@ -231,7 +231,6 @@ If cacheguard fails, your message is sent.
 - Hermes changes often, so at startup cacheguard checks that the Hermes parts it uses still exist.
 - If one moved, cacheguard says so in one short sentence, once per chat. For example:
   - `cacheguard cannot block here: it only warns.`
-  - `cacheguard lines may reach the model.`
   - `cacheguard is off: it could not start.`
 - It only reports: what cacheguard does stays the same.
 

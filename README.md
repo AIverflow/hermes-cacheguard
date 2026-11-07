@@ -111,7 +111,7 @@ Example: with `pause_m 10` and `size_k 20`, you come back after 12 minutes to a 
 
 - `13:05`: when the block happened, on the clock of the machine running Hermes. The text stays in the chat, so you can tell an old block from a new one.
 - `lost 4 of 10 similar pauses`: 4 of your past calls after a pause of about the same length (the same column of the `/cacheguard` table) lost the cache. It shows once there are 10 such calls.
-- **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
+- **Send it anyway:** type `/retry`, or send the same text again. It then goes out with no new check, however long you wait, unless Hermes restarts in between. In Telegram and other chats, `/retry` is a tappable command. In the web UI, `/retry` shows `[Message withheld: …]` as your message: the model still gets the text you typed.
 - Once a message is sent, the pause clock restarts: no new block until the next pause.
 - **Start over:** `/new`, then paste the message. The session ID lets the new chat read the old one back.
 - After a model change the text reads `BLOCKED · 13:05 · model changed a → b · ~48,000 tokens may be rebilled`.
@@ -137,7 +137,7 @@ The message goes out at once. The same line has `WARN` or `OK` after the time (t
 
 ![Result lines after a reply: cache lost, then cache reused](docs/images/result-lines.png)
 
-Switching model or provider in a large chat gives the same block (`model changed`) or line (`..., model changed`), even without a pause: the new model has no cache yet. [Details](docs/guide.md#model-change).
+Switching model or provider in a large chat gives the same block (`model changed`) or line (`..., model changed`), even without a pause: the new model has no cache yet. A switch of provider alone (same model name) gives only the line. [Details](docs/guide.md#model-change).
 
 Small chats and short pauses stay silent. The lines are not sent to the model ([details](docs/guide.md#what-the-model-sees)). They appear as short chat notices, not as part of the model reply.
 

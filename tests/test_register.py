@@ -42,7 +42,7 @@ def test_register_without_llm_execution_middleware_still_loads(env):
 
 
 @pytest.mark.parametrize("hook, effect", [
-    ("llm_request", "cacheguard lines may reach the model."),
+    ("llm_request", "cacheguard cannot block here: it only warns."),
     ("transform_llm_output", "no result lines."),
     ("pre_llm_call", "cacheguard cannot block here: it only warns."),
 ])

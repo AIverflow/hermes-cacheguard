@@ -242,6 +242,7 @@ _MIN_CHANCE_CALLS = 10  # measurements in a pause bucket before the block text s
 _MIN_TABLE_CALLS = 5  # measurements before the summary shows the cold-cache table
 _MIN_SUGGEST_CALLS = 20  # measurements of a model before the table suggests a pause for it
 _SUGGEST_LOSS = 0.10  # suggested pause: the longest one where at most this share of calls lost the cache
+_SUGGEST_SUPPORT = 5  # measurements at or past a pause before it can be suggested
 
 
 def _measured_gap(row: dict[str, Any]) -> float | None:
@@ -310,16 +311,17 @@ def _short_tokens(count: int) -> str:
 
 def _suggested_pause(points: list[tuple[float, bool]]) -> str:
     """The longest pause whose fitted loss share is _SUGGEST_LOSS or less; none when even the
-    shortest is above (a + after the pause: no block above, the longest pause seen);
-    — below _MIN_SUGGEST_CALLS measurements."""
+    shortest is above (a + after the pause: no block above); never past the pause that
+    _SUGGEST_SUPPORT measurements reach; — below _MIN_SUGGEST_CALLS measurements."""
     if len(points) < _MIN_SUGGEST_CALLS:
         return "—"
+    cap = sorted(gap for gap, _ in points)[-_SUGGEST_SUPPORT]  # one long lucky pause is not enough
     best = None
     for _, last, share, _ in _loss_blocks(points):
         if share > _SUGGEST_LOSS:
             return "none" if best is None else _short_pause(best)
-        best = last
-    return _short_pause(best) + "+"  # no block above the limit: nothing lost beyond the longest pause seen
+        best = min(last, cap)
+    return _short_pause(best) + "+"  # no block above the limit: nothing lost beyond it
 
 
 def _suggested_pauses(evaluated: list[dict[str, Any]], model_filter: str = "") -> dict[str, str]:

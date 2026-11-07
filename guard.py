@@ -490,7 +490,9 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
     """
     try:
         # Without the middleware the chat's time never moves on: every message would be blocked.
-        if config._is_unattended(kwargs) or _is_auxiliary(kwargs) or not health._healthy("middleware"):
+        # Without llm_request the BLOCKED reply would reach the model.
+        if (config._is_unattended(kwargs) or _is_auxiliary(kwargs) or not health._healthy("middleware")
+                or not health._healthy("llm_request")):
             return None
         sid = kwargs.get("session_id")
         text = kwargs.get("user_message")

@@ -1439,6 +1439,12 @@ def test_hook_lets_it_go_when_the_middleware_is_off(env, monkeypatch):
     assert _hook(env) is None
 
 
+def test_hook_lets_it_go_when_llm_request_is_off(env, monkeypatch):
+    _blockable(env)
+    monkeypatch.setitem(env.plugin._H["checks"], "llm_request", (False, "missing"))
+    assert _hook(env) is None  # the BLOCKED reply could not be kept from the model
+
+
 def test_hook_garbage_arguments_let_it_go(env):
     assert env.plugin._on_pre_llm_call() is None
     assert env.plugin._on_pre_llm_call(session_id=["bad"], user_message=3) is None
