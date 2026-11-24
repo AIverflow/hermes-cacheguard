@@ -314,3 +314,75 @@ def test_suggested_failure_leaves_the_cell_out(env):
     out = env.plugin._cmd_show("all")
     line = next(ln for ln in out.splitlines() if ln.startswith("p/m"))
     assert line.split()[-1] == "—" and "0/22" in line
+
+
+# ---- tokens rebilled per cause ----------------------------------------------
+def _recent(**kwargs):
+    import time
+    return observation(ts=time.time() - 3600, **kwargs)
+
+
+def _cause_lines(out):
+    lines = out.splitlines()
+    start = lines.index("Tokens rebilled, last 30 days")
+    return lines[start:]
+
+
+def test_cause_section_splits_rewrite_and_sums_tokens(env):
+    rows = [
+        _recent(model="p/a", prompt=100000, read=10000, expected=100000),  # pause: 90k lost
+        _recent(model="p/b", prompt=50000, read=5000, expected=50000),  # pause: 45k lost
+        _recent(prompt=100000, read=99000, expected=100000),  # pause, cache kept: not counted
+        _recent(cause="rewrite", prompt=80000, read=10000, expected=80000),  # same size: context changed
+        _recent(cause="rewrite", prompt=40000, read=2000, expected=100000),  # shrank: compaction
+        _recent(cause="rewrite", prompt=80000, read=79000, expected=80000),  # cache kept: not counted
+        _recent(model="p/c", cause="model_switch", prompt=30000, read=0, expected=None),
+        _recent(cause="usage_missing", prompt=None, read=None, expected=None),
+    ]
+    rows[-1]["cache_write_tokens"] = None
+    env.plugin._load_observations = lambda: rows
+    lines = _cause_lines(env.plugin._cmd_show("all"))
+    by_cause = {line[:17].strip(): line[17:].split() for line in lines[2:]}
+    assert lines[1].split() == ["cause", "count", "tokens", "largest"]
+    assert by_cause == {
+        "pause": ["2", "135k", "90k", "p/a"],
+        "context changed": ["1", "70k", "70k", "p/m"],
+        "compaction": ["1", "38k", "38k", "p/m"],
+        "model switch": ["1", "30k", "30k", "p/c"],
+        "total": ["5", "273k"],
+    }
+
+
+def test_cause_section_keeps_the_last_30_days_and_the_model_filter(env):
+    import time
+    old = observation(ts=time.time() - 31 * 86400, prompt=100000, read=1000, expected=100000)
+    rows = [old, _recent(model="p/a", prompt=50000, read=0, expected=50000, cause="rewrite"),
+            _recent(model="q/b", prompt=20000, read=0, expected=20000, cause="rewrite")]
+    env.plugin._load_observations = lambda: rows
+    by_cause = {ln[:17].strip(): ln[17:].split() for ln in _cause_lines(env.plugin._cmd_show("p/"))[2:]}
+    assert by_cause["pause"] == ["0", "0", "—"]
+    assert by_cause["context changed"] == ["1", "50k", "50k", "p/a"]
+
+
+def test_cause_section_counts_a_change_after_a_long_pause_as_the_pause(env):
+    rows = [_recent(cause="model_switch", gap=4 * 3600, prompt=60000, read=0, expected=None),
+            _recent(cause="rewrite", gap=599, prompt=50000, read=0, expected=50000)]
+    env.plugin._load_observations = lambda: rows
+    by_cause = {ln[:17].strip(): ln[17:].split() for ln in _cause_lines(env.plugin._cmd_show())[2:]}
+    assert by_cause["pause"] == ["1", "60k", "60k", "p/m"]  # pause_m is 10 minutes
+    assert by_cause["context changed"] == ["1", "50k", "50k", "p/m"]
+    assert by_cause["model switch"] == ["0", "0", "—"]
+
+
+def test_cause_section_small_shrink_is_context_changed_not_compaction(env):
+    rows = [_recent(cause="rewrite", prompt=90000, read=0, expected=100000),  # 10% smaller
+            _recent(cause="rewrite", prompt=60000, read=0, expected=100000)]  # 40% smaller
+    env.plugin._load_observations = lambda: rows
+    by_cause = {ln[:17].strip(): ln[17:].split() for ln in _cause_lines(env.plugin._cmd_show())[2:]}
+    assert by_cause["context changed"][:2] == ["1", "90k"]
+    assert by_cause["compaction"][:2] == ["1", "60k"]
+
+
+def test_cause_section_is_left_out_without_a_recent_loss(env):
+    env.plugin._load_observations = lambda: [_recent(), observation(prompt=100, read=0, cause="rewrite")]
+    assert "Tokens rebilled" not in env.plugin._cmd_show("all")

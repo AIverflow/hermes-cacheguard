@@ -8,7 +8,6 @@ Hermes plugin that warns or blocks before a large chat message is sent after a p
 - Each name has one home module; other modules read it as `module.name` (never `from .x import name`), so a test patch on the home module reaches every caller. Rebound globals are set as `module.name = ...`. A local variable must not be named like a module (`config`, `guard`...): it would hide the module.
 - `plugin.yaml`: manifest, includes `tested_hermes`.
 - `tests/`: pytest, one `test_<module>.py` per plugin module (`test_register.py` for `__init__.py`); `test_report.py` covers the `/cacheguard` table, `test_gateway_contract.py` and `test_e2e_*.py` are live checks; `test_hermes_compat.py` tests `scripts/hermes_compat.py`. `conftest.py` holds the fakes and shared helpers. `env.plugin` is a view over the package and its modules: reading finds the name anywhere, `monkeypatch.setattr(env.plugin, "_x", ...)` writes to the module that holds it.
-- `.tickets/` and `.scratch/` are the maintainer's local notes, git-ignored. They may be absent: do not depend on them.
 
 ## Commands
 - Tests: `python3 -m pytest -q` (must stay green).
@@ -34,3 +33,4 @@ Hermes plugin that warns or blocks before a large chat message is sent after a p
 - No new setting, mode, command, alias, fallback, or default that depends on another setting without the maintainer's explicit OK. `tests/test_config.py` freezes the list of `DEFAULTS` keys and `tests/test_commands.py` the `/cacheguard` sub-commands: a change there must be asked for.
 - Do not push, publish or spend provider money without an explicit request.
 - Open work is tracked by the maintainer outside the repo. If unsure what is wanted, ask.
+- If an `AGENTS.local.md` exists next to this file, read it too: the maintainer's private rules (git-ignored).

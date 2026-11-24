@@ -23,9 +23,9 @@ If you use the DeepSeek provider, its cache lasts 3 days to a week (measured), s
 
 ## Install
 
-Needs Hermes 0.22.6 or newer.
+Needs Hermes 0.22.6 up to 0.23.2. Hermes 0.23.3 and newer keep the cache warm by themselves: a cacheguard version for them comes next.
 
-    hermes plugins install https://github.com/AIverflow/hermes-cacheguard.git --enable
+    hermes plugins install cacheguard --enable
 
 Then [restart the gateway](#restart-the-gateway) and start a new chat.
 
@@ -37,6 +37,7 @@ Hermes refuses a cacheguard version that is too new for it. Pick the version tha
 
 | cacheguard | Hermes | Git tag |
 |---|---|---|
+| 0.7.0 | 0.22.6 up to 0.23.2 | `v0.7.0` |
 | 0.6.0 | 0.22.6 or newer | `v0.6.0` |
 | 0.5.0 | 0.22.6 or newer | `v0.5.0` |
 | 0.4.0 | 0.22.5 or newer | `v0.4.0` |
@@ -145,7 +146,7 @@ Small chats and short pauses stay silent. The lines are not sent to the model ([
 
 | Command | What it does |
 |---|---|
-| `/cacheguard` | Every setting, and a table: how often the cache was lost, by pause length |
+| `/cacheguard` | Every setting, a table of how often the cache was lost by pause length, and the tokens rebilled by cause |
 | `/cacheguard setup <group\|model> <mode> [pause_m] [size_k]` | Set mode, pause and size (`pause_m` and `size_k`: both or neither); `model` = the model of this chat only |
 | `/cacheguard set <name> <value>` | Change one setting |
 | `/cacheguard set model <pause_m\|size_k\|mode\|reset> [value]` | Own setting for the model of this chat |

@@ -112,3 +112,46 @@ def test_webui_retry_after_block_sends_the_typed_text(webui, fake_provider):
     third_call = main_calls()[1]
     assert [json.dumps(m, sort_keys=True) for m in third_call[:len(retry_call)]] == \
         [json.dumps(m, sort_keys=True) for m in retry_call]  # the retry call is an exact prefix
+
+
+def test_webui_fallback_after_402_is_not_a_model_change(webui, fake_provider):
+    # The primary model has no credit (HTTP 402), Hermes falls back on every turn to the
+    # model of `fallback_providers`. No pause, cache intact: nothing must be blocked.
+    fake_provider.fail_models["fake-model"] = 402
+    fake_provider.cached_tokens = 29000
+    with open(webui.home.home / "config.yaml", "a") as f:
+        f.write("fallback_providers:\n  - provider: custom\n    model: fallback-model\n"
+                f"    base_url: {fake_provider.url}\n    api_key: fake-key\n")
+    sid = webui.call("/api/session/new", {})["session"]["session_id"]
+
+    def replies():
+        msgs = webui.call("/api/session?session_id=" + sid)["session"].get("messages") or []
+        return [str(m.get("content")) for m in msgs if m["role"] == "assistant"]
+
+    for n, text in enumerate(("one", "two", "three"), 1):
+        _until(lambda: _start(webui, sid, text), f"turn {n} accepted")  # 409 while the previous turn ends
+        _until(lambda: len(replies()) >= n, f"reply {n}")
+        assert not any("BLOCKED" in r for r in replies()), replies()
+    assert {r.get("model") for r in fake_provider.requests} >= {"fake-model", "fallback-model"}
+
+
+def test_webui_model_switch_is_blocked_then_resend_sends(webui, fake_provider):
+    # A real model switch (the web UI's model picker) in a chat: blocked before the call, no pause needed.
+    sid = webui.call("/api/session/new", {})["session"]["session_id"]
+
+    def replies():
+        msgs = webui.call("/api/session?session_id=" + sid)["session"].get("messages") or []
+        return [str(m.get("content")) for m in msgs if m["role"] == "assistant"]
+
+    webui.call("/api/chat/start", {"session_id": sid, "message": "hello"})
+    _until(lambda: replies(), "first reply")
+    webui.call("/api/session/update", {"session_id": sid, "model": "other-model", "model_provider": "custom"})
+    _until(lambda: _start(webui, sid, "second"), "second turn accepted")
+    _until(lambda: any("BLOCKED" in r for r in replies()), "BLOCKED reply")
+    assert any("model changed" in r for r in replies()), replies()
+    assert not any("second" in str(r["messages"][-1]["content"]) for r in fake_provider.requests)  # not sent
+
+    _until(lambda: _start(webui, sid, "second"), "resend accepted")
+    _until(lambda: replies()[-1:] == ["pong"], "reply after resend")
+    sent = [r for r in fake_provider.requests if "second" in str(r["messages"][-1]["content"])]
+    assert len(sent) == 1 and sent[0]["model"] == "other-model"

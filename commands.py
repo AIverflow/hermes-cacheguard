@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import time
 from typing import Any
 
 from . import config, confirm, health, measure, storage
@@ -328,7 +329,32 @@ def _summary(parts: list[str], show_all: bool, platform: str) -> str:
         lines.append("(nothing counted yet: no call after a pause could be compared with the one before it)")
     if len(shown) < len(selected):
         lines.append(f"... {len(selected) - len(shown)} more models: /cacheguard all")
+    causes = _cause_table(evaluated, model_filter, config._pause_seconds(cfg["pause_m"]))
+    if causes:
+        lines += ["", causes[0]]
+        lines += ["```", *causes[1:], "```"] if _markdown_surface(platform) else causes[1:]
     return "\n".join(lines)
+
+
+_CAUSE_ROWS = ("pause", "context changed", "compaction", "model switch")
+
+
+def _cause_table(evaluated: list[dict[str, Any]], model_filter: str, pause_s: float) -> list[str]:
+    """Title and lines of the tokens rebilled per cause; nothing when no call lost the cache."""
+    try:
+        losses = measure._cause_losses(evaluated, model_filter, time.time(), pause_s)
+    except Exception:
+        return []
+    if not losses:
+        return []
+    cells = [(name, losses.get(name, {"count": 0, "tokens": 0})) for name in _CAUSE_ROWS]
+    rows = [(name, cell["count"], cell["tokens"],
+             f"{measure._short_tokens(cell['largest']):>7}  {cell['model']}" if cell["count"] else f"{'—':>7}")
+            for name, cell in cells]
+    rows.append(("total", sum(c["count"] for _, c in cells), sum(c["tokens"] for _, c in cells), ""))
+    return ["Tokens rebilled, last 30 days", f"{'cause':<17}  count  tokens  largest"] + [
+        f"{name:<17}  {count:>5}  {measure._short_tokens(tokens):>6}  {largest}".rstrip()
+        for name, count, tokens, largest in rows]
 
 
 _OTHER_SETTINGS = ("tiny_block", "block_images", "display_on_success", "journal_rows", "chat_files")

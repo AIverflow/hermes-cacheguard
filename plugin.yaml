@@ -1,9 +1,9 @@
 name: cacheguard
-version: "0.6.0"
+version: "0.7.0"
 tested_hermes: "0.22.7"
 description: "Warns or blocks a large chat after a pause, when the prompt cache may have expired, and shows how often the cache was lost."
 author: "AIverflow"
-requires_hermes: ">=0.22.6"
+requires_hermes: ">=0.22.6,<0.23.3"
 config_schema:
   cli:
     type: str

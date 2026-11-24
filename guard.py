@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -15,12 +16,23 @@ _LOG = logging.getLogger(__name__)
 _PENDING: dict[str, str] = {}  # session_id -> note to post after that session's next reply
 _PENDING_TURN: dict[str, str] = {}  # session_id -> turn_id the note belongs to (when known)
 _WARNED: dict[str, str] = {}  # session_id -> warn-mode marker, shown with the result
-_CHANGED: dict[str, tuple[str, str]] = {}  # session_id -> (previous, new) model of a model-change turn
 _HELD: dict[str, str] = {}  # session_id -> sha256 of the user message the pre_llm_call hook just blocked
 _NOTICES_SEEN: dict[str, set] = {}  # session_id -> one-off notices already posted to that session
 # session_id -> (api_request_id, message count, hash, prefix changed?) of the call being sent;
 # saved to the session file once the call is answered (see _record_response)
 _PREFIX_PENDING: dict[str, tuple[str, int, str, bool]] = {}
+
+# The start of a message Hermes writes itself (a background command ended, a subagent finished, a /loop,
+# /goal or heartbeat turn, the restart auto-resume): the user did not type it and cannot resend it, so it is
+# never blocked. Our own copy of the texts. After a restart, text the user typed reaches the hook without the note.
+_HERMES_NOTICE = re.compile(
+    r"\s*\[(?:IMPORTANT: (?:Background process |\d+ background processes completed|Watch[- ]pattern)"
+    r"|Background process \S+ heartbeat"
+    r"|ASYNC DELEGATION (?:BATCH COMPLETE|COMPLETE|TASK FAILED)"
+    r"|/loop wakeup #|Continuing toward your standing goal|Heartbeat \u2014 recurring instruction"
+    r"|System note: The previous turn was interrupted by )",
+    re.IGNORECASE,
+)
 
 
 def _is_auxiliary(payload: dict[str, Any]) -> bool:
@@ -47,10 +59,7 @@ def _on_llm_execution(**kwargs: Any) -> Any:
         surface_mode = config._surface_mode(kwargs, cfg)
         triggered = None if auxiliary else _evaluate(kwargs, cfg, surface_mode)
         if triggered:
-            _, model, prev, _ = triggered
-            if prev is not None and isinstance(sid, str) and sid:
-                _CHANGED[sid] = (prev, model)
-            _act(kwargs, surface_mode, f"model changed {prev} → {model}" if prev is not None else "")
+            _act(kwargs, surface_mode)
             acted = True
     except Exception:
         pass  # the plugin failed: the message goes out
@@ -62,7 +71,6 @@ def _start_turn(sid: str) -> None:
     _PENDING.pop(sid, None)  # a line left by a turn that had no reply text
     _PENDING_TURN.pop(sid, None)
     _WARNED.pop(sid, None)  # and a warning left by a turn whose provider call failed
-    _CHANGED.pop(sid, None)
 
 
 def _send(kwargs: dict[str, Any], next_call: Any, acted: bool, display_on_success: bool) -> Any:
@@ -94,21 +102,20 @@ def _compact_pause(gap_s: float) -> str:
     return f"{count} {_COMPACT_UNITS[unit]}"
 
 
-def _outcome_text(row: dict[str, Any], change: tuple[str, str] | None = None) -> str:
+def _outcome_text(row: dict[str, Any]) -> str:
     """This held attempt's measurement as one short line (the TUI status bar cuts at ~45 characters)."""
-    gap = row.get("gap_s")
-    pause = f", {_compact_pause(gap)}" if config._finite_number(gap) and change is None else ""
-    if change is not None:
+    if row.get("cause") == "model_switch":  # known only now: the call succeeded on another model
         reloaded = measure._reloaded_on_change(row)
         if reloaded is None:
             return "cache unknown, model changed"
         if measure._cache_lost(reloaded, row["prompt_tokens"]):
             return f"cache lost, {measure._short_tokens(reloaded)} rebilled, model changed"
         return f"{measure._short_tokens(row['cache_read_tokens'])} reused, model changed"
+    gap = row.get("gap_s")
+    pause = f", {_compact_pause(gap)}" if config._finite_number(gap) else ""
     if not row["evaluable"]:
         reason = {
             "usage_missing": "usage unavailable",
-            "model_switch": "model changed",
             "rewrite": "context changed",
         }.get(row.get("cause"))
         if row.get("cause") == "start":
@@ -148,17 +155,16 @@ def _queue_outcome(kwargs: dict[str, Any], row: dict[str, Any],
     """
     sid = kwargs.get("session_id")
     warned = _WARNED.pop(sid, None) if isinstance(sid, str) else None
-    change = _CHANGED.pop(sid, None) if isinstance(sid, str) else None
     # A reused cache after a warning is good news: say OK, keep WARN for a loss or an unknown.
-    if change is None:
-        reused = row.get("evaluable") and not row.get("cold")
-    else:
+    if row.get("cause") == "model_switch":
         reloaded = measure._reloaded_on_change(row)
         reused = reloaded is not None and not measure._cache_lost(reloaded, row["prompt_tokens"])
+    else:
+        reused = row.get("evaluable") and not row.get("cold")
     if reused and not display_on_success:
         return  # cache kept and nothing else to say; state above is already popped
     tag = "" if warned is None else ("OK " if reused else "WARN ")
-    body = _outcome_text(row, change)
+    body = _outcome_text(row)
     _queue_note(sid, f"{config._POST_PREFIX} {confirm._clock()} {tag}{body}", kwargs.get("turn_id"))
 
 
@@ -401,17 +407,17 @@ def _on_llm_request(**kwargs: Any) -> Any:
     return None
 
 
-def _act(kwargs: dict[str, Any], mode: Any, warn_note: str) -> None:
+def _act(kwargs: dict[str, Any], mode: Any) -> None:
     """Apply a mode ("off" | "warn" | "block"): mark the session for the result line.
 
-    Nothing is printed before the send: warn_note ("" or a short reason) marks the session, and the
-    result line after the reply starts with `WARN` or `OK`. Block is done by the pre_llm_call hook
+    Nothing is printed before the send: the mark on the session makes the result line after the
+    reply start with `WARN` or `OK`. Block is done by the pre_llm_call hook
     (_on_pre_llm_call); here it only warns.
     """
     if mode == "off":
         return
     if isinstance(kwargs.get("session_id"), str) and kwargs.get("session_id"):
-        _WARNED[kwargs["session_id"]] = warn_note
+        _WARNED[kwargs["session_id"]] = ""
 
 
 def _domain_key(payload: dict[str, Any]) -> str:
@@ -439,12 +445,10 @@ def _cooldown_active(rec: dict[str, Any], payload: dict[str, Any], cfg: dict[str
     return config._finite_number(sent_at) and 0 <= now - sent_at < config._pause_seconds(cfg["pause_m"])  # future time: clock went back
 
 
-def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) -> tuple[int, str, str | None, float | None] | None:
-    """Return (size, model, previous_model, gap_s) when the guard fires, else None.
+def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) -> tuple[int, str, None, float] | None:
+    """Return (size, model, None, gap_s), the idle gap that crossed the pause window, when the guard fires, else None.
 
-    previous_model is set (and gap_s is None) when the session's model or provider changed: a
-    different model can never reuse the old cache, whatever the idle gap. Otherwise gap_s is the
-    idle gap that crossed the pause window.
+    A model change is not checked here (see _asked_model_changed for the block, measure for the result line).
     """
     # Only the first call of a turn: the read that pays the cold context.
     if int(kwargs.get("api_call_count") or 0) != 1:
@@ -459,16 +463,6 @@ def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) ->
     now = time.time()
     if _cooldown_active(rec, kwargs, cfg, now):
         return None
-    prev = rec.get("model") if isinstance(rec.get("model"), str) else None
-    mode_changed = (isinstance(rec.get("api_mode"), str) and kwargs.get("api_mode")
-                    and rec["api_mode"] != kwargs["api_mode"])
-    if prev and (prev != model or mode_changed):
-        if mode_changed:
-            prev = f"{prev} ({rec['api_mode']} → {kwargs['api_mode']})"
-        size = measure.score_risk(rec, {"request": kwargs.get("request")})["tokens_at_risk"]
-        if size < config._size_tokens(cfg["size_k"]):
-            return None
-        return size, model, prev, None
     risk = measure.score_risk(rec, {
         "request": kwargs.get("request"), "now": now, "settings": cfg,
     })
@@ -476,6 +470,33 @@ def _evaluate(kwargs: dict[str, Any], cfg: dict[str, Any], surface_mode: Any) ->
     if not factors["window_crossed"] or not factors["floor_crossed"]:
         return None
     return risk["tokens_at_risk"], model, None, factors["gap_s"]
+
+
+def _remember_asked(sid: str, asked: Any) -> None:
+    """Keep the model Hermes was asked to use this turn (the chat's session file). Never raises."""
+    try:
+        with storage._storage_lock():
+            rec = storage._read_session(sid)
+            if isinstance(asked, str) and rec.get("asked_model") != asked:
+                storage._write_json_atomic(storage._session_file(sid), dict(rec, asked_model=asked))
+    except Exception:
+        pass
+
+
+def _asked_model_changed(rec: dict[str, Any], asked: Any, history: list[Any], model_key: str,
+                         cfg: dict[str, Any]) -> tuple[int, str, str, None] | None:
+    """(size, model, previous_model, None) for a real `/model` switch in a large chat, else None.
+
+    Real: the model asked for this turn is not the one asked last turn, and not the one that
+    answered last either (a fallback answering for a failing primary is not a switch).
+    """
+    stored, was_asked = rec.get("model"), rec.get("asked_model")
+    if not (isinstance(asked, str) and isinstance(was_asked, str) and isinstance(stored, str) and "/" in stored):
+        return None
+    if was_asked == asked or stored.split("/", 1)[1] == asked:
+        return None
+    size = measure.score_risk(rec, {"request": {"messages": history}})["tokens_at_risk"]
+    return (size, model_key, stored, None) if size >= config._size_tokens(cfg["size_k"]) else None
 
 
 def _text_hash(text: str) -> str:
@@ -498,6 +519,8 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
         text = kwargs.get("user_message")
         if isinstance(text, list):  # the TUI passes a message with an image as its content parts
             text = "\n\n".join(p["text"] for p in text if _is_text_part(p))
+        if isinstance(text, str) and _HERMES_NOTICE.match(text):
+            return None  # a Hermes notice, not typed by the user
         held = _HELD.pop(sid, None) if isinstance(sid, str) else None
         # The web UI's /retry sends Hermes's withheld line in place of the blocked text (kept in the row above).
         if held is not None and isinstance(text, str) and (held == _text_hash(text) or text == config._WITHHELD):
@@ -509,9 +532,12 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
             return None  # nothing to look up: no chat file read
         # Hermes gives only the model name here: the provider is the one the chat last used.
         rec = storage._get_session(sid)
+        asked = kwargs.get("model")
+        _remember_asked(sid, asked)
         stored = rec.get("model")
         provider = stored.split("/", 1)[0] if isinstance(stored, str) else None
-        cfg = config._model_cfg(cfg, config._model_key(provider, kwargs.get("model")))
+        model_key = config._model_key(provider, asked)
+        cfg = config._model_cfg(cfg, model_key)
         if config._surface_mode(kwargs, cfg) != "block" or confirm._single_query():
             return None
         history = kwargs.get("conversation_history")
@@ -527,7 +553,7 @@ def _on_pre_llm_call(**kwargs: Any) -> Any:
             "model": kwargs.get("model"), "api_mode": rec.get("api_mode"),
             "request": {"messages": history},
         }
-        triggered = _evaluate(payload, cfg, "block")
+        triggered = _asked_model_changed(rec, asked, history, model_key, cfg) or _evaluate(payload, cfg, "block")
         if not triggered:
             return None
         size, model, prev, gap_s = triggered

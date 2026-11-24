@@ -70,13 +70,9 @@ def test_bot_chat_like_quiet_call_is_pure_pass_through(env, mode):
     assert env.plugin._read_session("s1") == before
 
 
-@pytest.mark.parametrize("trigger", ["idle", "model_change"])
-def test_gateway_warn_mode_is_nonblocking(env, trigger):
+def test_gateway_warn_mode_is_nonblocking(env):
     env.config.update(gateway="warn", cli="off", size_k=1)
-    if trigger == "idle":
-        seed_session(env, ago=3600)
-    else:
-        seed_session(env, ago=10, model="p/old")
+    seed_session(env, ago=3600)
     out, called, sentinel = run_middleware(env, platform="telegram", model="new")
     assert called and out is sentinel and env.warned() is not None
 
@@ -137,27 +133,109 @@ def test_no_trigger(env, case):
 
 
 @pytest.mark.parametrize("mode", ["off", "warn", "block"])
-def test_model_change_off_warn_block(env, mode):
-    seed_session(env, ago=10, model="p/old")  # short gap: only model-change can fire
+def test_model_change_is_not_warned_before_the_call(env, mode):
+    seed_session(env, ago=10, model="p/old")  # short gap: only a model change could fire
     env.config["cli"] = mode
     out, called, sentinel = run_middleware(env, model="new")
-    assert called and out is sentinel  # block is the pre_llm_call hook's job: here it only warns
-    if mode == "off":
+    assert called and out is sentinel
+    assert env.warned() is None
+
+
+def _asked(env, real, asked, ago=10, mode="block"):
+    """A chat whose last call was answered by `real` (provider/model) when `asked` was requested."""
+    env.config["cli"] = mode
+    put_session(env.plugin, "s1", {"last_api_ts": time.time() - ago, "model": real, "asked_model": asked})
+
+
+def test_hook_real_model_switch_is_blocked_and_the_resend_passes(env):
+    _asked(env, "p/old", "old")
+    out = _hook(env, model="new")
+    assert out["message"] == (env.plugin._BLOCKED_PREFIX + "13:05 · "
+                              + "model changed p/old → p/new · ~60,008 tokens may be rebilled" + RETRY_LINE)
+    assert _hook(env, model="new") is None  # the resend
+    assert _hook(env, "another message", model="new") is None  # asked model now stored: not a switch any more
+
+
+def test_hook_fallback_answering_in_place_of_the_primary_is_not_a_switch(env):
+    _asked(env, "p/fb", "primary")
+    assert _hook(env, model="primary") is None  # same model asked as last turn
+
+
+def test_hook_switch_to_the_model_that_was_already_answering_is_not_a_switch(env):
+    _asked(env, "p/fb", "primary")
+    assert _hook(env, model="fb") is None
+
+
+def test_hook_no_stored_asked_model_means_no_model_block(env):
+    _blockable(env, model="p/old")
+    seed_session(env, ago=10, model="p/old")  # no asked_model: first message of this chat file
+    assert _hook(env, model="new") is None
+
+
+def test_hook_model_switch_in_a_small_chat_is_not_blocked(env):
+    _asked(env, "p/old", "old")
+    assert _hook(env, "hi", model="new") is None
+
+
+def test_hook_model_with_slashes_after_the_provider(env):
+    _asked(env, "openrouter/deepseek/v4", "primary")
+    assert _hook(env, model="deepseek/v4") is None  # the fallback's own model name
+    _asked(env, "openrouter/deepseek/v4", "primary")
+    assert "model changed openrouter/deepseek/v4 → openrouter/other/m" in _hook(env, model="other/m")["message"]
+
+
+@pytest.mark.parametrize("mode", ["off", "warn"])
+def test_hook_model_switch_is_not_blocked_outside_block_mode(env, mode):
+    _asked(env, "p/old", "old", mode=mode)
+    assert _hook(env, model="new") is None
+
+
+def test_hook_keeps_the_asked_model_even_without_a_block(env):
+    _asked(env, "p/old", "old")
+    assert _hook(env, "hi", model="new") is None
+    assert env.plugin._get_session("s1")["asked_model"] == "new"
+
+
+def test_failing_primary_with_a_working_fallback_is_never_flagged(env, monkeypatch):
+    """Primary fails every call, the fallback answers: three turns, no block, no warning, no line."""
+    from types import SimpleNamespace
+    env.config.update(cli="block", size_k=1, display_on_success=True)
+    clock = [100.0]
+    monkeypatch.setattr(env.plugin.time, "time", lambda: clock[0])
+
+    def failing():
+        raise RuntimeError("HTTP 400")
+
+    for turn in range(3):
+        clock[0] += 10
+        assert _hook(env, model="primary") is None  # Hermes passes the configured (primary) name
+        with pytest.raises(RuntimeError):
+            env.plugin._on_llm_execution(next_call=failing, request=big_request(), session_id="s1",
+                                         model="primary", provider="p", api_call_count=1,
+                                         api_mode="chat_completions", platform="cli")
+        response = SimpleNamespace(usage=_usage(20000, 19000))
+        env.plugin._on_llm_execution(next_call=lambda: response, request=big_request(), session_id="s1",
+                                     model="fb", provider="or", api_call_count=1,
+                                     api_mode="chat_completions", platform="cli")
         assert env.warned() is None
-    else:
-        assert "model changed" in env.warned()
+        assert _reply(env) is None
+    assert env.posted == []
 
 
-def test_model_change_same_model_silent(env):
-    seed_session(env, ago=10, model="p/m1")
-    run_middleware(env, model="m1")
-    assert env.warned() is None
-
-
-def test_model_change_small_context_silent(env):
-    seed_session(env, ago=10, model="p/old")
-    run_middleware(env, model="new", request={"messages": [], "tools": []})
-    assert env.warned() is None
+def test_model_change_after_a_call_gets_a_result_line(env, monkeypatch):
+    """A call that succeeded on another model than the last one: line after the reply, no warning before."""
+    from types import SimpleNamespace
+    env.config.update(cli="block", size_k=1, display_on_success=True)
+    clock = [100.0]
+    monkeypatch.setattr(env.plugin.time, "time", lambda: clock[0])
+    _send_observed(env, session_id="s1", model="m1", provider="p", usage=_usage(60000, 59000))
+    clock[0] += 10
+    response = SimpleNamespace(usage=_usage(60000, 0))
+    env.plugin._on_llm_execution(next_call=lambda: response, request=big_request(), session_id="s1",
+                                 model="m2", provider="p", api_call_count=1,
+                                 api_mode="chat_completions", platform="cli")
+    assert _reply(env) is None
+    assert env.posted == ["CGUARD 13:05 cache lost, 60k rebilled, model changed"]
 
 
 # ------------------------------------------------------- plugin errors --
@@ -421,7 +499,7 @@ def test_kept_result_line_leaves_out_the_estimate_shown_before_sending(env, monk
 def test_model_change_result_has_no_pause_or_estimate(env):
     row = {"evaluable": False, "cause": "model_switch", "gap_s": 3600.0, "prompt_tokens": 30000,
            "cache_read_tokens": 0}
-    assert env.plugin._outcome_text(row, ("p/old", "p/new")) == "cache lost, 30k rebilled, model changed"
+    assert env.plugin._outcome_text(row) == "cache lost, 30k rebilled, model changed"
 
 
 # ------------------------------------------------------- surface groups ---
@@ -685,25 +763,25 @@ def _short_row(**over):
     return row
 
 
-@pytest.mark.parametrize("row,change,text", [
-    (_short_row(), None, "23k reused, 1 min"),
-    (_short_row(gap_s=None), None, "23k reused"),
-    (_short_row(cold=True, miss_delta=23000, gap_s=600.0), None, "cache lost, 23k rebilled, 10 min"),
-    (_short_row(cache_read_tokens=58000), ("a/x", "b/y"), "58k reused, model changed"),
-    (_short_row(prompt_tokens=None), ("a/x", "b/y"), "cache unknown, model changed"),
-    (_short_row(prompt_tokens=60000, cache_read_tokens=0), ("a/x", "b/y"),
+@pytest.mark.parametrize("row,text", [
+    (_short_row(), "23k reused, 1 min"),
+    (_short_row(gap_s=None), "23k reused"),
+    (_short_row(cold=True, miss_delta=23000, gap_s=600.0), "cache lost, 23k rebilled, 10 min"),
+    (_short_row(evaluable=False, cause="model_switch", cache_read_tokens=58000), "58k reused, model changed"),
+    (_short_row(evaluable=False, cause="model_switch", prompt_tokens=None), "cache unknown, model changed"),
+    (_short_row(evaluable=False, cause="model_switch", cache_read_tokens=0),
      "cache lost, 60k rebilled, model changed"),
-    (_short_row(evaluable=False, cause="start"), None, "cache unknown, first call"),
-    (_short_row(evaluable=False, cause="usage_missing"), None, "cache unknown, usage unavailable, 1 min"),
-    (_short_row(evaluable=False, cause="rewrite"), None, "cache unknown, context changed, 1 min"),
-    (_short_row(evaluable=False, api_mode="unknown"), None, "cache unknown, provider unknown, 1 min"),
-    (_short_row(evaluable=False, cache_read_tokens=0, needs_hits=2), None, "cache unknown, needs 2 more cache hits, 1 min"),
-    (_short_row(evaluable=False, cache_read_tokens=0, needs_hits=1), None, "cache unknown, needs 1 more cache hit, 1 min"),
-    (_short_row(evaluable=False, cache_read_tokens=0), None, "cache unknown, little history, 1 min"),
-    (_short_row(evaluable=False), None, "cache unknown, little history, 1 min"),
+    (_short_row(evaluable=False, cause="start"), "cache unknown, first call"),
+    (_short_row(evaluable=False, cause="usage_missing"), "cache unknown, usage unavailable, 1 min"),
+    (_short_row(evaluable=False, cause="rewrite"), "cache unknown, context changed, 1 min"),
+    (_short_row(evaluable=False, api_mode="unknown"), "cache unknown, provider unknown, 1 min"),
+    (_short_row(evaluable=False, cache_read_tokens=0, needs_hits=2), "cache unknown, needs 2 more cache hits, 1 min"),
+    (_short_row(evaluable=False, cache_read_tokens=0, needs_hits=1), "cache unknown, needs 1 more cache hit, 1 min"),
+    (_short_row(evaluable=False, cache_read_tokens=0), "cache unknown, little history, 1 min"),
+    (_short_row(evaluable=False), "cache unknown, little history, 1 min"),
 ])
-def test_outcome_text(env, row, change, text):
-    assert env.plugin._outcome_text(row, change) == text
+def test_outcome_text(env, row, text):
+    assert env.plugin._outcome_text(row) == text
 
 
 def test_warn_tag_is_short(env, monkeypatch):
@@ -1240,6 +1318,52 @@ def test_hook_blocks_after_a_pause_in_block_mode(env):
     assert out == {"action": "block", "message": env.plugin._BLOCKED_PREFIX + "13:05 · 60 minutes pause 🕐 · ~60,008 tokens may be rebilled" + RETRY_LINE}
 
 
+@pytest.mark.parametrize("start", [
+    '[IMPORTANT: Background process proc_1 completed normally (exit code 0).\nCommand: npm ci\nOutput:\n',
+    '[IMPORTANT: Background process proc_1 matched watch pattern "ready".\nCommand: x\nMatched output:\n',
+    '[IMPORTANT: 2 background processes completed. Treat these results as one batch.]\n\n',
+    '[IMPORTANT: Watch patterns disabled for process proc_1 \u2014 too many matches.]\n',
+    '[IMPORTANT: Watch-pattern overflow: >15 notifications in 10s.]\n',
+    '[Background process proc_1 heartbeat #2 \u2014 still running after 5m (next in 60s).\nOutput:\n',
+    '[ASYNC DELEGATION COMPLETE \u2014 d1]\nA background subagent you dispatched earlier has finished.\n',
+    '[ASYNC DELEGATION BATCH COMPLETE \u2014 d1]\n',
+    '[ASYNC DELEGATION TASK FAILED \u2014 d1, task 1/3]\n',
+    '[/loop wakeup #3, every 5m]\nRecurring task: check the build\n',
+    '[Continuing toward your standing goal]\nGoal: ship it\n',
+    '[Continuing toward your standing goal \u2014 a quality gate failed]\nGoal: ship it\n',
+    '[Heartbeat \u2014 recurring instruction, fires every 1h]\ncheck mail\n',
+    '[System note: The previous turn was interrupted by a gateway restart; the gateway is now back online. ]',
+    '  \n[important: background process proc_1 completed normally]\n',
+])
+def test_hook_a_hermes_notice_passes_after_a_pause(env, start):
+    _blockable(env)
+    assert _hook(env, start + "x" * 240000) is None
+
+
+def test_hook_a_message_after_a_notice_is_still_blocked(env):
+    _blockable(env)
+    assert _hook(env, "[IMPORTANT: Background process p done]" + "x" * 240000) is None
+    assert _hook(env)["action"] == "block"
+
+
+def test_hook_a_notice_does_not_use_up_the_resend(env):
+    _blockable(env)
+    assert _hook(env)["action"] == "block"
+    assert _hook(env, "[IMPORTANT: Background process p done]" + "x" * 240000) is None
+    assert _hook(env) is None  # the resend of the blocked text still passes
+
+
+@pytest.mark.parametrize("text", [
+    "see [IMPORTANT: Background process p done] " + "x" * 240000,
+    "[IMPORTANT: look at this] " + "x" * 240000,
+    "[Background process notes] " + "x" * 240000,
+    "[System note: Your previous turn was interrupted] " + "x" * 240000,
+])
+def test_hook_a_message_that_only_looks_like_a_notice_is_blocked(env, text):
+    _blockable(env)
+    assert _hook(env, text)["action"] == "block"
+
+
 def test_hook_block_text_has_the_loss_counts_when_known(env):
     _blockable(env)
     _cold_history(env.plugin, cold=6, warm=4)
@@ -1383,16 +1507,10 @@ def test_hook_text_parts_are_blocked_like_a_string(env):
     assert _hook(env, history=[{"role": "user", "content": parts}])["action"] == "block"
 
 
-def test_hook_model_change_is_found_by_the_bare_name(env):
+def test_hook_a_different_model_after_a_pause_is_a_pause_block(env):
     _blockable(env, model="p/old")
     out = _hook(env, model="new")
-    assert out["message"] == (env.plugin._BLOCKED_PREFIX + "13:05 · "
-                              + "model changed p/old → p/new · ~60,008 tokens may be rebilled" + RETRY_LINE)
-
-
-def test_hook_same_bare_model_is_a_pause_not_a_model_change(env):
-    _blockable(env, model="p/m1")
-    assert "model changed" not in _hook(env, model="m1")["message"]
+    assert "pause" in out["message"] and "model changed" not in out["message"]
 
 
 def test_hook_api_mode_change_is_not_a_model_change_here(env):

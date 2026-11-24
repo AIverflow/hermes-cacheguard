@@ -184,10 +184,52 @@ def evaluate_observations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+_CAUSE_WINDOW_S = 30 * 86400  # the per-cause table covers the last 30 days
+_CAUSE_NAMES = {"rewrite": "context changed", "model_switch": "model switch"}
+_COMPACT_SHRINK = 0.30  # a rewrite that shrank the prompt this much is a compaction (real ones shrink 55-75%)
+
+
+def _lost_tokens(row: dict[str, Any], pause_s: float) -> tuple[str, int] | None:
+    """(cause, tokens rebilled) of an evaluated row that lost the cache; None when it kept it,
+    cannot be judged, or reported no usage. A change after a pause of pause_s or more counts as
+    the pause: the cache was likely gone anyway."""
+    cause = row.get("cause")
+    if cause is None:
+        return ("pause", row["miss_delta"]) if row.get("evaluable") and row.get("cold") else None
+    reloaded = _reloaded_on_change(row)
+    if cause not in _CAUSE_NAMES or reloaded is None or not _cache_lost(reloaded, row["prompt_tokens"]):
+        return None
+    if config._finite_number(row.get("gap_s")) and row["gap_s"] >= pause_s:
+        return "pause", reloaded
+    prev = row.get("prev_prompt_tokens")
+    if cause == "rewrite" and config._finite_number(prev) and prev - row["prompt_tokens"] > _COMPACT_SHRINK * prev:
+        return "compaction", reloaded
+    return _CAUSE_NAMES[cause], reloaded
+
+
+def _cause_losses(evaluated: list[dict[str, Any]], model_filter: str, now: float,
+                  pause_s: float) -> dict[str, dict[str, Any]]:
+    """Per cause, the last 30 days: lost calls, tokens rebilled, the largest loss and its model."""
+    out: dict[str, dict[str, Any]] = {}
+    for row in evaluated:
+        model, ts = str(row.get("model") or "unknown"), row.get("ts")
+        if not config._finite_number(ts) or ts < now - _CAUSE_WINDOW_S or model_filter not in model.lower():
+            continue
+        lost = _lost_tokens(row, pause_s)
+        if lost is None:
+            continue
+        cell = out.setdefault(lost[0], {"count": 0, "tokens": 0, "largest": 0, "model": ""})
+        cell["count"] += 1
+        cell["tokens"] += lost[1]
+        if lost[1] > cell["largest"]:
+            cell["largest"], cell["model"] = lost[1], model
+    return out
+
+
 def _record_response(payload: dict[str, Any], response: Any, dispatch_ts: float, response_ts: float,
                      acted: bool) -> dict[str, Any] | None:
     """Keep the call's row and session update. The verdict (it needs the whole journal) only when
-    `acted`: the guard warned, so a result line is due."""
+    `acted` (the guard warned) or the call changed the model: a result line is due."""
     raw_usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
     prompt = cached = written = None
     if raw_usage is not None:
@@ -231,7 +273,7 @@ def _record_response(payload: dict[str, Any], response: Any, dispatch_ts: float,
             # the guard's idle clock only. Stats keep measuring pauses between main calls.
             storage._write_json_atomic(storage._session_file(sid), dict(rec, cache_touch_ts=response_ts))
     # A display failure must not lose the row or replay the provider call.
-    return evaluate_observations(rows + [row])[-1] if acted and row else None
+    return evaluate_observations(rows + [row])[-1] if row and (acted or row["cause"] == "model_switch") else None
 
 
 # Edges sit 1 minute past 5 min, 20-min steps and 1 h: the measured pause runs a

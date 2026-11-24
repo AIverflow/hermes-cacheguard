@@ -70,6 +70,7 @@ class FakeProvider:
         self.prompt_tokens = 30000
         self.cached_tokens = 0
         self.requests = []
+        self.fail_models = {}  # model name -> HTTP status answered instead of "pong" (402 = no credit)
         provider = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -84,6 +85,15 @@ class FakeProvider:
                     self.end_headers()
                     return
                 provider.requests.append(body)
+                status = provider.fail_models.get(body.get("model"))
+                if status:
+                    out = json.dumps({"error": {"message": "insufficient credit", "type": "billing"}}).encode()
+                    self.send_response(status)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(out)))
+                    self.end_headers()
+                    self.wfile.write(out)
+                    return
                 usage = {"prompt_tokens": provider.prompt_tokens, "completion_tokens": 2,
                          "total_tokens": provider.prompt_tokens + 2,
                          "prompt_tokens_details": {"cached_tokens": provider.cached_tokens}}

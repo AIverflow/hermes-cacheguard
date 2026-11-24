@@ -106,7 +106,7 @@ Other commands:
 
 ## Model change
 
-A cache belongs to one model. If you switch model or provider in a large chat, the block text says `model changed a → b` (in `warn`, the result line ends `, model changed`): the new model has no cache yet, so the whole chat is billed again. No pause is needed. Like the pause block, it shows only when the group is `warn` or `block` and the chat is over the size limit.
+A cache belongs to one model. If you switch model or provider in a large chat, the block text says `model changed a → b` (in `warn`, the result line ends `, model changed`): the new model has no cache yet, so the whole chat is billed again. No pause is needed. Like the pause block, it shows only when the group is `warn` or `block` and the chat is over the size limit. If your model fails and Hermes's fallback model answers instead, that is not a switch: nothing is blocked.
 
 If you switch back quickly (A → B → A), A's cache may still be there. The result line shows what was really reused.
 
@@ -134,6 +134,20 @@ A call lost the cache when at least 30% of the previous prompt was not read from
 - The table shows from 5 measurements in all. Before that, it says `(3 measurements so far, need at least 5)`.
 - `/cacheguard all` shows every model with at least one counted pause, not only the top 10. Models with none are left out.
 
+Below the table, `Tokens rebilled, last 30 days` adds up the calls that lost the cache, by cause:
+
+    cause              count  tokens  largest
+    pause                 29    2.0M     220k  openrouter/deepseek/deepseek-v4.1-flash-1017
+    context changed        9    1.5M     196k  deepseek/deepseek-v4-flash
+    compaction             2     98k      56k  deepseek/deepseek-v4-flash
+    model switch           3     58k      23k  anthropic/claude-sonnet-5-5
+    total                 43    3.6M
+
+- `tokens`: tokens sent again at full price. `largest`: the biggest single loss, and its model.
+- `compaction`: the chat changed and shrank by more than 30%, for example a Hermes summary.
+- A change or a model switch after a pause of `pause_m` or more counts as `pause`.
+- The first call of a chat is not counted. The section is left out when no call lost the cache.
+
 
 ## The block text and the result line
 
@@ -143,6 +157,7 @@ The basics are in the [README](../README.md#using-it). More:
 
 - The chat paused at least `pause_m` and holds at least `size_k` tokens.
 - After a model change, no pause is needed.
+- Messages Hermes writes itself are never blocked: a background command or subagent finished, a /loop, /goal or heartbeat turn, the resume after a restart.
 
 **The block text**
 
@@ -217,7 +232,7 @@ The gateway needs one to a few minutes to start. Meanwhile a chat may show a bla
 
 Each profile has its own plugin, settings and history. Put `-p <profile>` after `hermes`:
 
-    hermes -p <profile> plugins install https://github.com/AIverflow/hermes-cacheguard.git --enable
+    hermes -p <profile> plugins install cacheguard --enable
     hermes -p <profile> plugins update cacheguard
     hermes -p <profile> plugins disable cacheguard
 
