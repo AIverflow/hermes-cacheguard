@@ -206,7 +206,7 @@ def test_failing_primary_with_a_working_fallback_is_never_flagged(env, monkeypat
     def failing():
         raise RuntimeError("HTTP 400")
 
-    for turn in range(3):
+    for _turn in range(3):
         clock[0] += 10
         assert _hook(env, model="primary") is None  # Hermes passes the configured (primary) name
         with pytest.raises(RuntimeError):
@@ -214,7 +214,7 @@ def test_failing_primary_with_a_working_fallback_is_never_flagged(env, monkeypat
                                          model="primary", provider="p", api_call_count=1,
                                          api_mode="chat_completions", platform="cli")
         response = SimpleNamespace(usage=_usage(20000, 19000))
-        env.plugin._on_llm_execution(next_call=lambda: response, request=big_request(), session_id="s1",
+        env.plugin._on_llm_execution(next_call=lambda response=response: response, request=big_request(), session_id="s1",
                                      model="fb", provider="or", api_call_count=1,
                                      api_mode="chat_completions", platform="cli")
         assert env.warned() is None

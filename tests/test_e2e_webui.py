@@ -129,8 +129,8 @@ def test_webui_fallback_after_402_is_not_a_model_change(webui, fake_provider):
         return [str(m.get("content")) for m in msgs if m["role"] == "assistant"]
 
     for n, text in enumerate(("one", "two", "three"), 1):
-        _until(lambda: _start(webui, sid, text), f"turn {n} accepted")  # 409 while the previous turn ends
-        _until(lambda: len(replies()) >= n, f"reply {n}")
+        _until(lambda text=text: _start(webui, sid, text), f"turn {n} accepted")  # 409 while the previous turn ends
+        _until(lambda n=n: len(replies()) >= n, f"reply {n}")
         assert not any("BLOCKED" in r for r in replies()), replies()
     assert {r.get("model") for r in fake_provider.requests} >= {"fake-model", "fallback-model"}
 
